@@ -5,7 +5,7 @@ VisualStudioVersion = 17.14.35906.104 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TorrentWrapper", "TorrentWrapper\TorrentWrapper.csproj", "{ED94D6EB-EC6D-45C5-9D42-79E54ACB193D}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TorrentWrapper.Tests", "..\TorrentWrapper.Tests\TorrentWrapper.Tests.csproj", "{CF60B2EF-1130-7E91-4945-44EFA74BE63B}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TorrentWrapper.Tests", "TorrentWrapper.Tests\TorrentWrapper.Tests.csproj", "{CF60B2EF-1130-7E91-4945-44EFA74BE63B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

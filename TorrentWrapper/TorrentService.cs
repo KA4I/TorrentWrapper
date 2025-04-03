@@ -125,9 +125,8 @@ namespace TorrentWrapper
             int pieceLength = CalculatePieceLength(totalSize); // Use a helper method
             creator.PieceLength = pieceLength; // Set it on the creator for reference
 
-            // TODO: Construct the file structure for the vDictionary based on fileSource.Files
-            // This needs to match the format MonoTorrent expects when receiving a mutable item.
-            // For simplicity, let's assume a single file for now. A directory needs recursion.
+            // Construct the file structure for the vDictionary based on fileSource.Files.
+            // This uses the BEP47 format, which handles both single files and directories.
             var fileList = new MonoTorrent.BEncoding.BEncodedList(); // Qualify type
             // totalSize is already calculated above, remove re-declaration
             foreach (var file in fileSource.Files)
@@ -138,7 +137,7 @@ namespace TorrentWrapper
                     { "length", new MonoTorrent.BEncoding.BEncodedNumber(file.Length) } // Qualify type
                     // Add attributes if needed: { "attr", (MonoTorrent.BEncoding.BEncodedString)"x" }
                 });
-                totalSize += file.Length;
+                // totalSize was already calculated before the loop.
             }
 
             // 3. Prepare initial signed data (v dictionary, seq 0, signature)
@@ -478,21 +477,34 @@ namespace TorrentWrapper
             // --- Prepare New State ---
             long nextSequenceNumber = currentSequenceNumber + 1;
 
-            // Create source for the new file
+            // Create source for the new file or directory
             var newFileSource = new MonoTorrent.TorrentFileSource(filePathToAdd);
-            if (newFileSource.Files.Count() != 1)
-            {
-                // For simplicity, only handle adding single files for now. Directories need more complex merging.
-                throw new NotSupportedException("Adding directories or multiple files at once is not yet supported.");
-            }
-            var newFileMapping = newFileSource.Files.Single();
+            // The TorrentFileSource handles both single files and directories.
+            // We will iterate through all files discovered by it.
 
             // Construct the new file list BEncoding
-            var newFileListBEncoded = new MonoTorrent.BEncoding.BEncodedList(currentFileList); // Copy existing
-            newFileListBEncoded.Add(new MonoTorrent.BEncoding.BEncodedDictionary {
-                { "path", new MonoTorrent.BEncoding.BEncodedList(newFileMapping.Destination.Parts.ToArray().Select(s => (MonoTorrent.BEncoding.BEncodedString)s)) },
-                { "length", new MonoTorrent.BEncoding.BEncodedNumber(newFileMapping.Length) }
-            });
+            var newFileListBEncoded = new MonoTorrent.BEncoding.BEncodedList(currentFileList); // Copy existing list
+            foreach (var newFileMapping in newFileSource.Files)
+            {
+                 // Check if a file with the exact same path already exists. If so, skip adding it.
+                 // A more robust implementation might replace the existing entry, but for now, skipping avoids duplicates.
+                 bool alreadyExists = currentFileList.Cast<MonoTorrent.BEncoding.BEncodedDictionary>()
+                     .Any(existingDict =>
+                         existingDict.TryGetValue("path", out var pathValue) && pathValue is MonoTorrent.BEncoding.BEncodedList pathList &&
+                         pathList.Cast<MonoTorrent.BEncoding.BEncodedString>().Select(s => s.Text).ToArray().SequenceEqual(newFileMapping.Destination.Parts.ToArray())
+                     );
+
+                 if (!alreadyExists)
+                 {
+                     newFileListBEncoded.Add(new MonoTorrent.BEncoding.BEncodedDictionary {
+                         { "path", new MonoTorrent.BEncoding.BEncodedList(newFileMapping.Destination.Parts.ToArray().Select(s => (MonoTorrent.BEncoding.BEncodedString)s)) },
+                         { "length", new MonoTorrent.BEncoding.BEncodedNumber(newFileMapping.Length) }
+                         // Add attributes if needed: { "attr", (MonoTorrent.BEncoding.BEncodedString)"x" }
+                     });
+                 } else {
+                      Console.WriteLine($"[AddFileToMutableTorrentAsync] Skipped adding duplicate path: {newFileMapping.Destination}");
+                 }
+            }
 
             // --- Construct New vDictionary ---
             var newVDictionary = new MonoTorrent.BEncoding.BEncodedDictionary {
@@ -587,20 +599,50 @@ namespace TorrentWrapper
 
             // --- Prepare New State ---
             long nextSequenceNumber = currentSequenceNumber + 1;
-            var pathToRemoveParts = filePathToRemove.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            // Split the input path by both '/' and '\' to handle potential OS differences, removing empty entries
+            var pathToRemoveParts = filePathToRemove.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] Trying to remove path: {filePathToRemove} (Parsed as: [{string.Join(", ", pathToRemoveParts)}])");
+
 
             var newFileListBEncoded = new MonoTorrent.BEncoding.BEncodedList();
+            bool removedSomething = false;
             foreach (var item in currentFileList.Cast<MonoTorrent.BEncoding.BEncodedDictionary>())
             {
                 if (item.TryGetValue("path", out var pathValue) && pathValue is MonoTorrent.BEncoding.BEncodedList pathList)
                 {
                     var pathParts = pathList.Cast<MonoTorrent.BEncoding.BEncodedString>().Select(s => s.Text).ToArray();
-                    // Simple comparison - might need normalization for complex paths
-                    if (!pathParts.SequenceEqual(pathToRemoveParts))
+                    Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] Checking against path: [{string.Join(", ", pathParts)}]");
+
+
+                    // Check if the item's path starts with the path to remove.
+                    // This handles removing both single files and entire directories.
+                    bool isMatchOrSubPath = pathParts.Length >= pathToRemoveParts.Length &&
+                                            pathParts.Take(pathToRemoveParts.Length).SequenceEqual(pathToRemoveParts);
+
+                    if (!isMatchOrSubPath)
                     {
-                        newFileListBEncoded.Add(item); // Keep files that don't match
+                        Console.WriteLine("[RemoveFileFromMutableTorrentAsync] -> No match, keeping.");
+
+                        newFileListBEncoded.Add(item); // Keep items that don't match
+                    } else {
+                        Console.WriteLine("[RemoveFileFromMutableTorrentAsync] -> Match found, removing.");
+
+                        removedSomething = true; // Mark that we found something to remove
                     }
                 }
+                else
+                {
+                     // Keep items that don't have a valid path structure? Or log an error?
+                     // For now, let's keep them to be safe.
+                     newFileListBEncoded.Add(item);
+                }
+            }
+
+            if (!removedSomething)
+            {
+                 Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] Warning: Path '{filePathToRemove}' not found in torrent {torrentHandle.ToHex()}. No changes made to file list.");
+                 // Optionally throw an exception here if the path *must* exist for removal
+                 // throw new KeyNotFoundException($"Path '{filePathToRemove}' not found in the torrent.");
             }
 
             // --- Construct New vDictionary ---

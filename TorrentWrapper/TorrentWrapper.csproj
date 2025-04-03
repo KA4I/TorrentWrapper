@@ -8,7 +8,9 @@
 
   <ItemGroup>
     <!-- Changed from direct DLL reference to project reference -->
+    <!-- Corrected relative path to MonoTorrent project -->
     <ProjectReference Include="..\..\MonoTorrent\src\MonoTorrent.csproj" />
+    <!-- Removed reference to Tests project from main project -->
   </ItemGroup>
 
   <ItemGroup>

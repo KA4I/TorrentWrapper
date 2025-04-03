@@ -352,6 +352,292 @@ namespace TorrentWrapper.Tests
         // Note: UpdateFile test would be very similar to Add/Remove as it uses them internally.
         // A more robust test would involve a single-step update if that were implemented.
 
+
+
+        [TestMethod]
+        public async Task CreateMutableTorrent_WithDirectory_ShouldSucceed()
+        {
+            Assert.IsNotNull(_service1);
+            Assert.IsNotNull(_baseDirectory1);
+
+            // Create a directory structure
+            string dirPath = Path.Combine(_baseDirectory1!, "test_dir");
+            Directory.CreateDirectory(dirPath);
+            string file1 = CreateDummyFile(dirPath, "file1.txt", 10);
+            string subDirPath = Path.Combine(dirPath, "subdir");
+            Directory.CreateDirectory(subDirPath);
+            string file2 = CreateDummyFile(subDirPath, "file2.dat", 20);
+
+            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(dirPath);
+
+            Assert.IsNotNull(magnetLink, "MagnetLink should not be null.");
+            Assert.IsNotNull(privateKeySeed, "PrivateKeySeed should not be null.");
+            Assert.AreEqual(32, privateKeySeed.Length, "PrivateKeySeed should be 32 bytes.");
+            Assert.IsNotNull(initialIdentifier, "InitialIdentifier should not be null.");
+            Assert.IsTrue(magnetLink.ToV1Uri().ToString().Contains("xs=urn:btpk:"), "Magnet link should contain public key (xs).");
+
+            // Optional: Verify the created torrent contains the expected files (requires GetTorrentFilesAsync or similar)
+            // This part depends on how TorrentService exposes file lists. Assuming GetTorrentFilesAsync works:
+            // Need to wait for metadata if GetTorrentFilesAsync is used immediately after creation
+            // await Task.Delay(1000); // Give some time for manager to potentially process metadata
+            // try {
+            //     var files = await _service1.GetTorrentFilesAsync(initialIdentifier);
+            //     Assert.IsTrue(files.Any(f => f.EndsWith(Path.Combine("test_dir", "file1.txt"))), "File1 missing");
+            //     Assert.IsTrue(files.Any(f => f.EndsWith(Path.Combine("test_dir", "subdir", "file2.dat"))), "File2 missing");
+            // } catch (InvalidOperationException ex) when (ex.Message.Contains("metadata not yet available")) {
+            //     Assert.Inconclusive("Metadata was not available in time to verify file list.");
+            // }
+        }
+
+        [TestMethod]
+        public async Task AddDirectory_ShouldPropagateUpdate()
+        {
+            Assert.IsNotNull(_service1);
+            Assert.IsNotNull(_service2);
+            Assert.IsNotNull(_baseDirectory1);
+            Assert.IsNotNull(_baseDirectory2);
+
+            // Service 1 creates initial torrent
+            string initialFile = CreateDummyFile(_baseDirectory1!, "initial.txt", 10);
+            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile);
+
+            // Service 2 loads
+            string downloadPath2 = Path.Combine(_baseDirectory2!, "downloads_add_dir");
+            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
+            Assert.AreEqual(initialIdentifier, loadedIdentifier);
+
+            // Connect DHTs
+            await ConnectDhtsAsync();
+
+            // Setup event listener on Service 2
+            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
+            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
+                if (args.OriginalInfoHash == loadedIdentifier) {
+                    updateReceivedSignal.TrySetResult(args);
+                }
+            };
+
+            // Service 1 adds a directory
+            string dirToAddPath = Path.Combine(_baseDirectory1!, "new_dir");
+            Directory.CreateDirectory(dirToAddPath);
+            CreateDummyFile(dirToAddPath, "new_file1.txt", 30);
+            CreateDummyFile(Path.Combine(dirToAddPath, "new_subdir"), "new_file2.dat", 40);
+
+            long newSeq1 = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, dirToAddPath, privateKeySeed);
+            Assert.AreEqual(1, newSeq1, "Sequence number after adding directory should be 1.");
+
+            // Trigger update check on Service 2
+            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
+
+            // Wait for update
+            var receivedArgs = await WaitForUpdateAsync(updateReceivedSignal, 20000, "Service 2 did not receive the directory add update event.");
+            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null.");
+            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different after adding directory.");
+
+            // Optional: Verify file list on Service 2 after update
+        }
+
+        [TestMethod]
+        public async Task RemoveDirectory_ShouldPropagateUpdate()
+        {
+            Assert.IsNotNull(_service1);
+            Assert.IsNotNull(_service2);
+            Assert.IsNotNull(_baseDirectory1);
+            Assert.IsNotNull(_baseDirectory2);
+
+            // Service 1 creates with a directory
+            string dirPath = Path.Combine(_baseDirectory1!, "remove_dir_test");
+            Directory.CreateDirectory(dirPath);
+            CreateDummyFile(dirPath, "file_in_dir.txt", 15);
+            CreateDummyFile(Path.Combine(dirPath, "subdir"), "another_file.dat", 25);
+            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(dirPath);
+
+            // Service 2 loads
+            string downloadPath2 = Path.Combine(_baseDirectory2!, "downloads_remove_dir");
+            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
+            Assert.AreEqual(initialIdentifier, loadedIdentifier);
+
+            // Connect DHTs
+            await ConnectDhtsAsync();
+
+            // Setup event listener on Service 2
+            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
+            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
+                if (args.OriginalInfoHash == loadedIdentifier) {
+                    updateReceivedSignal.TrySetResult(args);
+                }
+            };
+
+            // Service 1 removes the directory
+            // Note: The path used for removal should be relative to the torrent root.
+            // Since dirPath was the root, we use its name.
+            string dirToRemoveRelative = Path.GetFileName(dirPath);
+            long newSeq1 = await _service1.RemoveFileFromMutableTorrentAsync(initialIdentifier, dirToRemoveRelative, privateKeySeed);
+            Assert.AreEqual(1, newSeq1, "Sequence number after removing directory should be 1.");
+
+            // Trigger update check on Service 2
+            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
+
+            // Wait for update
+            var receivedArgs = await WaitForUpdateAsync(updateReceivedSignal, 20000, "Service 2 did not receive the directory remove update event.");
+            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null after remove.");
+            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different after removing directory.");
+
+            // Optional: Verify file list on Service 2 after update (should be empty or only contain other top-level files if added)
+        }
+
+        // Helper to connect DHTs
+        private async Task ConnectDhtsAsync()
+        {
+             if (_service1?.DhtAccess != null && _service2?.DhtAccess != null && _settings1?.DhtEndPoint != null && _settings2?.DhtEndPoint != null)
+            {
+                var dummyId1 = MonoTorrent.Dht.NodeId.Create();
+                var dummyId2 = MonoTorrent.Dht.NodeId.Create();
+
+                byte[] nodeInfo1 = new byte[26];
+                dummyId1.Span.CopyTo(nodeInfo1.AsSpan(0, 20));
+                _settings1.DhtEndPoint.Address.GetAddressBytes().CopyTo(nodeInfo1.AsSpan(20, 4));
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(nodeInfo1.AsSpan(24, 2), (ushort)_settings1.DhtEndPoint.Port);
+
+                byte[] nodeInfo2 = new byte[26];
+                dummyId2.Span.CopyTo(nodeInfo2.AsSpan(0, 20));
+                _settings2.DhtEndPoint.Address.GetAddressBytes().CopyTo(nodeInfo2.AsSpan(20, 4));
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(nodeInfo2.AsSpan(24, 2), (ushort)_settings2.DhtEndPoint.Port);
+
+                _service2.DhtAccess.Add(new ReadOnlyMemory<byte>[] { nodeInfo1 });
+                _service1.DhtAccess.Add(new ReadOnlyMemory<byte>[] { nodeInfo2 });
+
+                await Task.Delay(1000); // Give time for nodes to potentially ping/pong
+                Console.WriteLine("[Test Helper] Explicitly added DHT nodes to each other.");
+            }
+            else
+            {
+                Console.WriteLine("[Test Helper] Could not connect DHTs: Service or settings were null.");
+            }
+        }
+
+        // Helper to wait for update event
+        private async Task<MutableTorrentUpdateInfoEventArgs> WaitForUpdateAsync(TaskCompletionSource<MutableTorrentUpdateInfoEventArgs> signal, int timeoutMs, string timeoutMessage)
+        {
+            Console.WriteLine($"[Test Helper {_service2?.GetHashCode()}] Waiting for update signal...");
+            var completedTask = await Task.WhenAny(signal.Task, Task.Delay(timeoutMs));
+            if (completedTask != signal.Task)
+            {
+                Assert.Fail(timeoutMessage);
+            }
+            Console.WriteLine($"[Test Helper {_service2?.GetHashCode()}] Update signal received.");
+            return await signal.Task; // Return the actual result
+        }
+
+
+
+        [TestMethod]
+        public async Task AddDeeplyNestedDirectory_ShouldPropagateUpdate()
+        {
+            Assert.IsNotNull(_service1);
+            Assert.IsNotNull(_service2);
+            Assert.IsNotNull(_baseDirectory1);
+            Assert.IsNotNull(_baseDirectory2);
+
+            // Service 1 creates initial torrent
+            string initialFile = CreateDummyFile(_baseDirectory1!, "root.txt", 5);
+            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile);
+
+            // Service 2 loads
+            string downloadPath2 = Path.Combine(_baseDirectory2!, "downloads_add_deep_dir");
+            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
+            Assert.AreEqual(initialIdentifier, loadedIdentifier);
+
+            // Connect DHTs
+            await ConnectDhtsAsync();
+
+            // Setup event listener on Service 2
+            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
+            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
+                if (args.OriginalInfoHash == loadedIdentifier) {
+                    updateReceivedSignal.TrySetResult(args);
+                }
+            };
+
+            // Service 1 adds a deeply nested directory
+            string deepDirPath = Path.Combine(_baseDirectory1!, "level1", "level2", "level3");
+            Directory.CreateDirectory(deepDirPath);
+            CreateDummyFile(deepDirPath, "deep_file.txt", 60);
+            CreateDummyFile(Path.Combine(_baseDirectory1!, "level1"), "level1_file.txt", 70);
+
+            // Add the top-level directory containing the nested structure
+            string dirToAddPath = Path.Combine(_baseDirectory1!, "level1");
+            long newSeq1 = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, dirToAddPath, privateKeySeed);
+            Assert.AreEqual(1, newSeq1, "Sequence number after adding deep directory should be 1.");
+
+            // Trigger update check on Service 2
+            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
+
+            // Wait for update
+            var receivedArgs = await WaitForUpdateAsync(updateReceivedSignal, 25000, "Service 2 did not receive the deep directory add update event."); // Increased timeout slightly
+            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null.");
+            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different after adding deep directory.");
+
+            // Optional: Verify file list on Service 2 after update
+            // Requires GetTorrentFilesAsync and potentially waiting for metadata
+        }
+
+        [TestMethod]
+        public async Task UpdateFileInNestedDirectory_ShouldPropagateUpdate()
+        {
+            Assert.IsNotNull(_service1);
+            Assert.IsNotNull(_service2);
+            Assert.IsNotNull(_baseDirectory1);
+            Assert.IsNotNull(_baseDirectory2);
+
+            // Service 1 creates with a nested structure
+            string dirPath = Path.Combine(_baseDirectory1!, "update_test_dir");
+            string subDirPath = Path.Combine(dirPath, "sub");
+            Directory.CreateDirectory(subDirPath);
+            string originalFilePath = CreateDummyFile(subDirPath, "file_to_update.txt", 100);
+            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(dirPath);
+
+            // Service 2 loads
+            string downloadPath2 = Path.Combine(_baseDirectory2!, "downloads_update_nested");
+            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
+            Assert.AreEqual(initialIdentifier, loadedIdentifier);
+
+            // Connect DHTs
+            await ConnectDhtsAsync();
+
+            // Setup event listener on Service 2 - Expect one update corresponding to the final state
+            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
+            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
+                if (args.OriginalInfoHash == loadedIdentifier) {
+                    Console.WriteLine($"[Test Handler UpdateNested] Received final update event.");
+                    updateReceivedSignal.TrySetResult(args); // Signal completion on the first (and only expected) update
+                }
+            };
+
+            // Service 1 updates the file
+            string updatedFilePath = CreateDummyFile(_baseDirectory1!, "updated_content.txt", 150); // Create new content elsewhere
+            // Construct the relative path using forward slashes, as expected in torrent metadata
+            // Construct the relative path using forward slashes, relative to the torrent's root
+            string relativePathToUpdate = "sub/file_to_update.txt";
+
+            await _service1.UpdateFileInMutableTorrentAsync(initialIdentifier, relativePathToUpdate, updatedFilePath, privateKeySeed);
+            // UpdateFile calls Remove then Add, so sequence number should be 2
+            // We need a way to get the *current* sequence number from service1, or assume it's 2.
+            // Let's skip sequence number assertion here as UpdateFile doesn't return it directly.
+
+            // Trigger update check on Service 2
+            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
+
+            // Wait for the update event corresponding to the final state (after the Add part of Update)
+            var receivedArgs = await WaitForUpdateAsync(updateReceivedSignal, 30000, "Service 2 did not receive the update event for nested file update."); // Increased timeout
+
+            // We only expect one event reflecting the final state
+            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in final event args should not be null.");
+            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different after updating nested file.");
+
+            // Optional: Verify file content/hash on Service 2 after update (requires download completion)
+        }
+
         // --- Test Methods End ---
 
     }

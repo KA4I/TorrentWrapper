@@ -21,8 +21,10 @@
 
   <ItemGroup>
     <!-- Also reference the modified MonoTorrent source -->
-    <ProjectReference Include="..\TorrentWrapper\TorrentWrapper\TorrentWrapper.csproj" />
-	<ProjectReference Include="..\MonoTorrent\src\MonoTorrent.csproj" />
+    <!-- Corrected relative path to the main TorrentWrapper project -->
+    <ProjectReference Include="..\TorrentWrapper\TorrentWrapper.csproj" />
+    <!-- Corrected relative path to the MonoTorrent project -->
+ <ProjectReference Include="..\..\MonoTorrent\src\MonoTorrent.csproj" />
   </ItemGroup>
 
 </Project>
