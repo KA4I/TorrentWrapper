@@ -4,9 +4,11 @@
 using MonoTorrent;
 using MonoTorrent.Client;
 using MonoTorrent.BEncoding;
+using MonoTorrent.Dht; // Added for NodeId
 // --- System/Standard Namespaces ---
 using System; // For Convert, InvalidOperationException, NotImplementedException, Buffer, Math, ArgumentException
 using System.Collections.Generic;
+using System.ComponentModel; // For EditorBrowsable
 using System.IO; // For Path
 using System.Linq; // For Select
 using System.Security.Cryptography; // For SHA1
@@ -46,16 +48,15 @@ namespace TorrentWrapper
 
     /// <summary>
     /// Provides a simplified interface for interacting with MonoTorrent,
-    /// focusing on mutable torrents (BEP46) for game communication.
+    /// focusing on mutable torrents (BEP46) for distributed data exchange.
     /// </summary>
-    public class TorrentService : IAsyncDisposable
+    public class TorrentService : IAsyncDisposable // Ensure IAsyncDisposable is declared
     {
         /// <summary>
         /// Raised when an update is available for a mutable torrent being managed by this service.
         /// The InfoHash provided is the *new* InfoHash for the updated torrent data.
         /// The application should typically stop the old torrent and start a new one with this InfoHash.
         /// </summary>
-        // Compiler Error CS0103 likely due to project reference issue. TorrentUpdateEventArgs is in MonoTorrent.Client.
         public event EventHandler<MutableTorrentUpdateInfoEventArgs>? MutableTorrentUpdateAvailable;
 
         private MonoTorrent.Client.ClientEngine? _engine; // Qualify
@@ -63,24 +64,97 @@ namespace TorrentWrapper
         private readonly Dictionary<MonoTorrent.InfoHash, long> _mutableSequenceNumbers = new(); // Tracks current seq number for mutable torrents we manage/modify
         private readonly Dictionary<MonoTorrent.InfoHash, byte[]> _publicKeys = new(); // Tracks public key for mutable torrents
         private readonly Dictionary<MonoTorrent.InfoHash, MonoTorrent.BEncoding.BEncodedDictionary> _lastKnownVDictionary = new(); // Tracks last known state
+        private readonly Dictionary<MonoTorrent.InfoHash, byte[]> _lastKnownSignature = new(); // Tracks last known signature
+        private string? _dhtNodesFilePath; // Path to store DHT nodes
 
+        private static readonly string[] DefaultBootstrapNodes = new[]
+        {
+            "router.bittorrent.com:6881",
+            "router.utorrent.com:6881",
+            "dht.transmissionbt.com:6881"
+        };
+
+        public IReadOnlyList<string> BootstrapNodes { get; init; } = DefaultBootstrapNodes;
 
         /// <summary>
         /// Exposes the public DHT interface for advanced scenarios (like testing).
         /// </summary>
         public MonoTorrent.Client.IDht? DhtAccess => _engine?.Dht;
 
+        public Dictionary<MonoTorrent.InfoHash, long> MutableSequenceNumbers => _mutableSequenceNumbers;
+
+        // --- Test Helpers ---
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public BEncodedDictionary? GetLastKnownVDictionaryForTest(InfoHash handle) =>
+            _lastKnownVDictionary.TryGetValue(handle, out var dict) ? dict : null;
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public byte[]? GetLastKnownSignatureForTest(InfoHash handle) =>
+            _lastKnownSignature.TryGetValue(handle, out var sig) ? sig : null;
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public void StoreItemLocallyForTest(byte[] publicKey, byte[]? salt, BEncodedDictionary value, long sequenceNumber, byte[] signature)
+        {
+             if (_engine?.Dht is MonoTorrent.Dht.DhtEngine dhtEngine)
+             {
+                var pk = (BEncodedString)publicKey;
+                var saltBE = salt == null ? null : (BEncodedString)salt;
+                var sig = (BEncodedString)signature;
+                dhtEngine.StoreMutableLocally(pk, saltBE, value, sequenceNumber, sig);
+             } else {
+                 Console.WriteLine("[StoreItemLocallyForTest] Warning: Could not cast DhtAccess to DhtEngine.");
+             }
+        }
+        // --- End Test Helpers ---
+
         /// <summary>
         /// Initializes the TorrentService and starts the MonoTorrent ClientEngine.
         /// </summary>
         /// <param name="settings">Optional engine settings.</param>
         /// <returns>A task representing the asynchronous operation.</returns>
-        public Task InitializeAsync(EngineSettings? settings = null)
+        public async Task InitializeAsync(EngineSettings? settings = null)
         {
-            _engine = new ClientEngine(settings ?? new EngineSettingsBuilder().ToSettings());
-            // DHT engine is managed internally by ClientEngine and starts automatically
-            // if enabled in settings (default is true).
-            return Task.CompletedTask;
+            var engineSettings = settings ?? new EngineSettingsBuilder().ToSettings();
+            _engine = new ClientEngine(engineSettings);
+
+            _dhtNodesFilePath = Path.Combine(engineSettings.CacheDirectory, "dht_nodes.dat");
+
+            ReadOnlyMemory<byte> initialNodes = ReadOnlyMemory<byte>.Empty;
+            if (!string.IsNullOrEmpty(_dhtNodesFilePath) && File.Exists(_dhtNodesFilePath))
+            {
+                try
+                {
+                    initialNodes = await File.ReadAllBytesAsync(_dhtNodesFilePath);
+                    initialNodes = await File.ReadAllBytesAsync(_dhtNodesFilePath);
+                    System.Diagnostics.Debug.WriteLine($"[TorrentService] Loaded {initialNodes.Length} bytes of DHT nodes from {_dhtNodesFilePath}"); // Use Debug.WriteLine
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[TorrentService] Warning: Failed to load DHT nodes from {_dhtNodesFilePath}: {ex.Message}"); // Use Debug.WriteLine
+                }
+            }
+            else
+            {
+                 System.Diagnostics.Debug.WriteLine($"[TorrentService] DHT nodes file path is null or file not found at '{_dhtNodesFilePath}'. Starting DHT from scratch."); // Use Debug.WriteLine
+            }
+
+            // The ClientEngine should implicitly start the DHT when needed.
+            // We don't need to manually call StartAsync on the DHT engine here.
+            // The engine will load nodes from the cache file if it exists.
+            if (_engine.Dht == null)
+            {
+                 System.Diagnostics.Debug.WriteLine("[TorrentService] DHT Engine is NULL after ClientEngine creation.");
+            } else {
+                 System.Diagnostics.Debug.WriteLine($"[TorrentService] DHT Engine exists. Type: {_engine.Dht.GetType().FullName}. State: {_engine.Dht.State}");
+                 // If nodes were loaded, add them. The engine might bootstrap itself later if needed.
+                 if (!initialNodes.IsEmpty) {
+                     System.Diagnostics.Debug.WriteLine($"[TorrentService] Adding {initialNodes.Length} bytes of cached DHT nodes via IDht.Add.");
+                     _engine.Dht.Add(new [] { initialNodes });
+                 }
+            }
+            // Removed the explicit BootstrapAsync call.
+
+
         }
 
         /// <summary>
@@ -88,175 +162,98 @@ namespace TorrentWrapper
         /// </summary>
         /// <param name="initialContentPath">Path to the initial file or directory for the torrent.</param>
         /// <returns>A tuple containing the MagnetLink, the non-secret private key (byte[]), and the initial InfoHash.</returns>
-        public async Task<(MonoTorrent.MagnetLink MagnetLink, byte[] PrivateKey, MonoTorrent.InfoHash InitialInfoHash)> CreateMutableTorrentAsync(string initialContentPath) // Qualify types
+        public async Task<(MonoTorrent.MagnetLink MagnetLink, byte[] PrivateKey, MonoTorrent.InfoHash InitialInfoHash)> CreateMutableTorrentAsync(string initialContentPath)
         {
             if (_engine == null) throw new InvalidOperationException("Service not initialized.");
 
-            // 1. Generate Ed25519 keypair using BouncyCastle
-            // Use alias for BouncyCastle types
-            var secureRandom = new BCrypt::Org.BouncyCastle.Security.SecureRandom();
-            var keyPairGenerator = BCrypt::Org.BouncyCastle.Security.GeneratorUtilities.GetKeyPairGenerator("Ed25519");
-            keyPairGenerator.Init(new BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519KeyGenerationParameters(secureRandom));
-            var keyPair = keyPairGenerator.GenerateKeyPair();
-            var privateKeyParams = (BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519PrivateKeyParameters)keyPair.Private;
-            var publicKeyParams = (BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519PublicKeyParameters)keyPair.Public;
-            byte[] privateKey = privateKeyParams.GetEncoded(); // 32 bytes seed + 32 bytes public key = 64 bytes
-            byte[] publicKey = publicKeyParams.GetEncoded();   // 32 bytes public key
+            byte[] signingKeySeed = GeneratePrivateKeySeed();
+            byte[] publicKey = GetPublicKeyFromSeed(signingKeySeed);
 
-            // Note: BEP44/46 typically uses the 32-byte seed as the 'private key' for signing,
-            // but BouncyCastle's private key encoding includes the public key. We need the 32-byte seed.
-            // Let's assume the first 32 bytes of the encoded private key are the seed.
-            // **Verification needed**: Confirm BouncyCastle's Ed25519PrivateKeyParameters.GetEncoded() format
-            // or find a way to get just the 32-byte seed if necessary. For now, we'll proceed assuming this.
-            byte[] signingKeySeed = privateKey.AsSpan(0, 32).ToArray(); // Assuming first 32 bytes are the seed
-
-            // 2. Create Torrent structure (TorrentCreator) - To get file info, piece length etc.
-            // We need this info for the 'v' dictionary, even if the standard 'info' dict isn't used directly for BEP46 hash.
-            var creator = new MonoTorrent.TorrentCreator(); // Qualify type
+            var creator = new MonoTorrent.TorrentCreator();
             creator.Comment = "Mutable Torrent created by TorrentWrapper";
-            // Announce URLs are typically not needed for pure DHT operation via BEP46.
-            // creator.Announce = "udp://tracker.example.com:80";
-
-            // Use TorrentFileSource to get info about the initial content
-            var fileSource = new MonoTorrent.TorrentFileSource(initialContentPath); // Qualify type
-
-            // Calculate total size to suggest a piece length
+            var fileSource = new MonoTorrent.TorrentFileSource(initialContentPath);
             long totalSize = fileSource.Files.Sum(f => f.Length);
-            int pieceLength = CalculatePieceLength(totalSize); // Use a helper method
-            creator.PieceLength = pieceLength; // Set it on the creator for reference
+            int pieceLength = CalculatePieceLength(totalSize);
+            creator.PieceLength = pieceLength;
 
-            // Construct the file structure for the vDictionary based on fileSource.Files.
-            // This uses the BEP47 format, which handles both single files and directories.
-            var fileList = new MonoTorrent.BEncoding.BEncodedList(); // Qualify type
-            // totalSize is already calculated above, remove re-declaration
+            var fileList = new MonoTorrent.BEncoding.BEncodedList();
             foreach (var file in fileSource.Files)
             {
-                // Example for a simple file list (BEP 47 structure might be needed for directories)
-                fileList.Add(new MonoTorrent.BEncoding.BEncodedDictionary { // Qualify type
-                    { "path", new MonoTorrent.BEncoding.BEncodedList(file.Destination.Parts.ToArray().Select(s => (MonoTorrent.BEncoding.BEncodedString)s)) }, // Qualify types
-                    { "length", new MonoTorrent.BEncoding.BEncodedNumber(file.Length) } // Qualify type
-                    // Add attributes if needed: { "attr", (MonoTorrent.BEncoding.BEncodedString)"x" }
+                fileList.Add(new MonoTorrent.BEncoding.BEncodedDictionary {
+                    { "path", new MonoTorrent.BEncoding.BEncodedList(file.Destination.Parts.ToArray().Select(s => (MonoTorrent.BEncoding.BEncodedString)s)) },
+                    { "length", new MonoTorrent.BEncoding.BEncodedNumber(file.Length) }
                 });
-                // totalSize was already calculated before the loop.
             }
 
-            // 3. Prepare initial signed data (v dictionary, seq 0, signature)
             long sequenceNumber = 0;
-
-            // Construct the 'v' dictionary (value to be stored in DHT)
-            // This needs to contain enough info for a client to reconstruct the torrent.
-            // Structure needs confirmation based on BEP44/46 and MonoTorrent expectations.
-            // Example structure (needs verification):
-            // Construct the 'v' dictionary
-            var vDictionary = new MonoTorrent.BEncoding.BEncodedDictionary { // Qualify type
-                { "name", (MonoTorrent.BEncoding.BEncodedString)fileSource.TorrentName }, // Qualify type
-                { "piece length", new MonoTorrent.BEncoding.BEncodedNumber(pieceLength) }, // Qualify type, add comma
-                // Using "files" list as per BEP46/BEP47 structure.
-                { "files", fileList } // Add the file list to the vDictionary
+            var vDictionary = new MonoTorrent.BEncoding.BEncodedDictionary {
+                { "name", (MonoTorrent.BEncoding.BEncodedString)fileSource.TorrentName },
+                { "piece length", new MonoTorrent.BEncoding.BEncodedNumber(pieceLength) },
+                { "files", fileList }
             };
-            var encodedVDictionary = vDictionary.Encode();
 
-            // Construct data to sign according to BEP44: "salt" + salt + "seq" + seq + "v" + value
-            // Salt is omitted here. Sequence number MUST be BEncoded.
-            var seqKey = new BEncodedString("seq");
-            var seqValue = new BEncodedNumber(sequenceNumber); // Use BEncodedNumber for seq
-            var vKey = new BEncodedString("v");
+            byte[] dataToSign = ConstructDataToSign(sequenceNumber, vDictionary);
+            byte[] signature = SignData(dataToSign, signingKeySeed);
 
-            // Calculate total length
-            int totalLength = seqKey.LengthInBytes() + seqValue.LengthInBytes() + vKey.LengthInBytes() + encodedVDictionary.Length;
-            var dataToSign = new byte[totalLength];
-
-            // Encode into the buffer
-            int offset = 0;
-            offset += seqKey.Encode(dataToSign.AsSpan(offset));
-            offset += seqValue.Encode(dataToSign.AsSpan(offset)); // Encode seq number
-            offset += vKey.Encode(dataToSign.AsSpan(offset));
-            offset += vDictionary.Encode(dataToSign.AsSpan(offset)); // Encode the dictionary itself
-
-            // Sign using BouncyCastle Ed25519Signer
-            var signer = new BCrypt::Org.BouncyCastle.Crypto.Signers.Ed25519Signer(); // Use alias
-            // Use the 32-byte seed for signing with BouncyCastle's Ed25519Signer
-            var signingPrivateKeyParams = new BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519PrivateKeyParameters(signingKeySeed); // Use alias
-            signer.Init(true, signingPrivateKeyParams);
-            signer.BlockUpdate(dataToSign, 0, dataToSign.Length);
-            byte[] signature = signer.GenerateSignature(); // 64 bytes signature
-
-            // 4. Perform initial DHT put
-            // Need to find the correct method in MonoTorrent's DhtEngine API.
-            // It likely takes public key, optional salt, sequence number, value (BEncodedValue), and signature.
-            // Example placeholder:
-            // Use the public IDht interface which now exposes PutMutableAsync
-            // Use _engine! now that we've checked for null
-            // Use _engine directly after null check, remove '!'
-            MonoTorrent.InfoHash initialIdentifier; // Declare earlier
-            using (var sha1 = SHA1.Create()) {
-                 initialIdentifier = new InfoHash(sha1.ComputeHash(publicKey));
-            }
-            Console.WriteLine($"[CreateMutableTorrentAsync] Calculated Initial Identifier (SHA1(PubKey)): {initialIdentifier.ToHex()}");
-            Console.WriteLine($"[CreateMutableTorrentAsync] Attempting DHT Put for PubKey: {Convert.ToHexString(publicKey).ToLowerInvariant()} | Seq: {sequenceNumber}");
+            MonoTorrent.InfoHash initialIdentifier = CalculateInfoHash(publicKey);
+            System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Calculated Initial Identifier (SHA1(PubKey)): {initialIdentifier.ToHex()}"); // Use Debug.WriteLine
+            System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Attempting DHT Put for PubKey: {Convert.ToHexString(publicKey).ToLowerInvariant()} | Seq: {sequenceNumber}"); // Use Debug.WriteLine
             try
             {
                 await _engine.Dht.PutMutableAsync(
                     publicKey: (BEncodedString)publicKey,
-                    salt: null, // Salt is optional, use null if not needed
+                    salt: null,
                     value: vDictionary,
                     sequenceNumber: sequenceNumber,
                     signature: (BEncodedString)signature
                 );
-                Console.WriteLine($"[CreateMutableTorrentAsync] DHT Put successful for {initialIdentifier.ToHex()}");
+                System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] DHT Put successful for {initialIdentifier.ToHex()}"); // Use Debug.WriteLine
             }
             catch (Exception ex)
             {
-                // Wrap DHT exceptions for clarity
-                // Compiler Error CS0103 likely due to project reference issue. TorrentException is in MonoTorrent.
-                Console.WriteLine($"[CreateMutableTorrentAsync] DHT Put FAILED for {initialIdentifier.ToHex()}: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] DHT Put FAILED for {initialIdentifier.ToHex()}: {ex.Message}"); // Use Debug.WriteLine
                 throw new TorrentException($"Failed to put initial mutable torrent data to DHT for '{initialIdentifier.ToHex()}'.", ex);
             }
 
-            // 5. Add the torrent to the local engine so it's managed
             var magnetLink = new MagnetLink(Convert.ToHexString(publicKey).ToLowerInvariant(), name: fileSource.TorrentName);
             string savePath = Path.GetDirectoryName(initialContentPath) ?? throw new ArgumentException("Could not determine directory from initialContentPath.", nameof(initialContentPath));
-            // Ensure the save directory exists (MonoTorrent might handle this, but better safe)
             Directory.CreateDirectory(savePath);
 
             TorrentManager manager;
-            Console.WriteLine($"[CreateMutableTorrentAsync] Attempting Engine.AddAsync for Magnet: {magnetLink}");
+            System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Attempting Engine.AddAsync for Magnet: {magnetLink}"); // Use Debug.WriteLine
             try
             {
-                manager = await _engine.AddAsync(magnetLink, savePath);
-                Console.WriteLine($"[CreateMutableTorrentAsync] Engine.AddAsync successful for {initialIdentifier.ToHex()}. Manager State: {manager?.State}");
+                // Prevent manager from interacting with DHT initially for mutable torrents
+                var settingsBuilder270 = new TorrentSettingsBuilder();
+                settingsBuilder270.AllowDht = false;
+                manager = await _engine.AddAsync(magnetLink, savePath, settingsBuilder270.ToSettings());
+                System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Engine.AddAsync successful for {initialIdentifier.ToHex()}. Manager State: {manager?.State}"); // Use Debug.WriteLine
             }
             catch (Exception ex)
             {
-                // If adding fails after DHT put, we have an inconsistent state.
-                // Consider if cleanup (DHT delete?) is needed, though complex.
-                Console.WriteLine($"[CreateMutableTorrentAsync] Engine.AddAsync FAILED for {initialIdentifier.ToHex()}: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Engine.AddAsync FAILED for {initialIdentifier.ToHex()}: {ex.Message}"); // Use Debug.WriteLine
                  throw new TorrentException($"Failed to add created mutable torrent '{initialIdentifier.ToHex()}' to the engine.", ex);
              }
 
-             // Add null check for manager
              if (manager == null)
              {
-                 // Handle the case where AddAsync returns null unexpectedly
-                 Console.WriteLine($"[CreateMutableTorrentAsync] Engine.AddAsync returned null for {initialIdentifier.ToHex()}.");
+                 System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Engine.AddAsync returned null for {initialIdentifier.ToHex()}."); // Use Debug.WriteLine
                  throw new TorrentException($"Failed to obtain TorrentManager for created mutable torrent '{initialIdentifier.ToHex()}'.");
              }
 
-             // 6. Store manager and subscribe to updates
              _managedTorrents.Add(initialIdentifier, manager);
              _publicKeys[initialIdentifier] = publicKey;
             _mutableSequenceNumbers[initialIdentifier] = sequenceNumber;
             _lastKnownVDictionary[initialIdentifier] = vDictionary;
-            // Safely log manager infohashes, checking for null
+            _lastKnownSignature[initialIdentifier] = signature;
             string managerInfoHashHex = manager?.InfoHashes?.V1OrV2?.ToHex() ?? "N/A";
-            Console.WriteLine($"[CreateMutableTorrentAsync] Subscribing TorrentManager ({managerInfoHashHex}) TorrentUpdateAvailable event for {initialIdentifier.ToHex()}.");
-            manager.TorrentUpdateAvailable += OnTorrentUpdateAvailable; // Subscribe for updates
-            // Start the torrent manager so it can seed/participate in DHT
-            await manager.StartAsync();
-            Console.WriteLine($"[CreateMutableTorrentAsync] Started TorrentManager for {initialIdentifier.ToHex()}.");
-
-            // 7. Return magnet link, private key (seed), infohash
-            Console.WriteLine($"[CreateMutableTorrentAsync] Completed for {initialIdentifier.ToHex()}.");
+            System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Subscribing TorrentManager ({managerInfoHashHex}) TorrentUpdateAvailable event for {initialIdentifier.ToHex()}."); // Use Debug.WriteLine
+            manager.TorrentUpdateAvailable += OnTorrentUpdateAvailable;
+            // Do not start the manager here. It will enter MetadataMode if needed
+            // and start itself once metadata is retrieved, preventing the NullRef during DHT announce.
+            System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Manager added for {initialIdentifier.ToHex()}. It will start automatically after metadata retrieval if needed."); // Use Debug.WriteLine
+ 
+            System.Diagnostics.Debug.WriteLine($"[CreateMutableTorrentAsync] Completed for {initialIdentifier.ToHex()}."); // Use Debug.WriteLine
             return (magnetLink, signingKeySeed, initialIdentifier);
         }
 
@@ -266,75 +263,62 @@ namespace TorrentWrapper
         /// <param name="magnetLink">The magnet link (can be standard or BEP46 xs=).</param>
         /// <param name="savePath">The directory to save torrent data.</param>
         /// <returns>A handle or identifier for the managed torrent.</returns>
-        public async Task<InfoHash> LoadTorrentAsync(MagnetLink magnetLink, string savePath) // Use using directive
+        public async Task<InfoHash> LoadTorrentAsync(MagnetLink magnetLink, string savePath)
         {
-            Console.WriteLine($"[LoadTorrentAsync] Loading Magnet: {magnetLink}");
+            System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Loading Magnet: {magnetLink}"); // Use Debug.WriteLine
             if (_engine == null) throw new InvalidOperationException("Service not initialized.");
 
-            // Determine the primary identifier (InfoHash or PublicKeyHash)
-            MonoTorrent.InfoHash identifier; // Qualify type
-            byte[]? mutablePublicKey = null; // Store the public key if it's a mutable torrent
+            MonoTorrent.InfoHash identifier;
+            byte[]? mutablePublicKey = null;
 
-            if (magnetLink.InfoHashes != null && (magnetLink.InfoHashes.V1 != null || magnetLink.InfoHashes.V2 != null)) { // Check InfoHashes null first
+            if (magnetLink.InfoHashes != null && (magnetLink.InfoHashes.V1 != null || magnetLink.InfoHashes.V2 != null)) {
                 identifier = magnetLink.InfoHashes.V1OrV2;
             } else if (!string.IsNullOrEmpty(magnetLink.PublicKeyHex)) {
-                // For BEP46, use the SHA1 hash of the public key as the identifier
                 mutablePublicKey = Convert.FromHexString(magnetLink.PublicKeyHex);
-                using (var sha1 = SHA1.Create()) { // Use using directive
-                    identifier = new InfoHash(sha1.ComputeHash(mutablePublicKey)); // Use using directive
-                    Console.WriteLine($"[LoadTorrentAsync] Identified as Mutable Torrent. Identifier (SHA1(PubKey)): {identifier.ToHex()}");
-                }
+                identifier = CalculateInfoHash(mutablePublicKey);
+                System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Identified as Mutable Torrent. Identifier (SHA1(PubKey)): {identifier.ToHex()}"); // Use Debug.WriteLine
             } else {
                 throw new ArgumentException("Magnet link does not contain a valid InfoHash or Public Key.", nameof(magnetLink));
             }
 
-            // Check if already managed
             if (_managedTorrents.ContainsKey(identifier))
             {
-                // Optionally, just return the existing handle or throw an error
-                // For now, let's return the existing identifier
-                Console.WriteLine($"[LoadTorrentAsync] Already managing {identifier.ToHex()}, returning.");
+                System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Already managing {identifier.ToHex()}, returning."); // Use Debug.WriteLine
                 return identifier;
-                // Or: throw new InvalidOperationException($"Torrent with identifier {identifier} is already managed.");
             }
 
-            // Add the torrent to the engine
-            // Use _engine! now that we've checked for null
-            // Use _engine directly after null check, remove '!'
-            Console.WriteLine($"[LoadTorrentAsync] Attempting Engine.AddAsync for {identifier.ToHex()}...");
-             TorrentManager manager = await _engine.AddAsync(magnetLink, savePath); // Use using directive
-             Console.WriteLine($"[LoadTorrentAsync] Engine.AddAsync successful for {identifier.ToHex()}. Manager State: {manager?.State}");
-
-             // Add null check for manager
+            System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Attempting Engine.AddAsync for {identifier.ToHex()}..."); // Use Debug.WriteLine
+             // Pass specific settings only if it's a mutable torrent identified by public key
+             TorrentSettings? torrentSettings = null;
+             if (mutablePublicKey != null) {
+                 var settingsBuilder333 = new TorrentSettingsBuilder();
+                 settingsBuilder333.AllowDht = false;
+                 torrentSettings = settingsBuilder333.ToSettings();
+             }
+             TorrentManager manager = await _engine.AddAsync(magnetLink, savePath, torrentSettings);
+             System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Engine.AddAsync successful for {identifier.ToHex()}. Manager State: {manager?.State}"); // Use Debug.WriteLine
+ 
              if (manager == null)
              {
-                 Console.WriteLine($"[LoadTorrentAsync] Engine.AddAsync returned null for {identifier.ToHex()}.");
+                 System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Engine.AddAsync returned null for {identifier.ToHex()}."); // Use Debug.WriteLine
                  throw new TorrentException($"Failed to obtain TorrentManager for loaded torrent '{identifier.ToHex()}'.");
              }
 
-             // Store the manager and potentially the public key/initial sequence state
              _managedTorrents.Add(identifier, manager);
              if (mutablePublicKey != null)
             {
                 _publicKeys[identifier] = mutablePublicKey;
-                // Subscribe to the update event for mutable torrents
-                // Compiler Error CS0122 likely due to project reference issue. OnTorrentUpdateAvailable signature depends on TorrentUpdateEventArgs.
-                // Safely log manager infohashes, checking for null
                 string loadedManagerInfoHashHex = manager?.InfoHashes?.V1OrV2?.ToHex() ?? "N/A";
-                Console.WriteLine($"[LoadTorrentAsync] Subscribing TorrentManager ({loadedManagerInfoHashHex}) TorrentUpdateAvailable event for mutable torrent {identifier.ToHex()}.");
+                System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Subscribing TorrentManager ({loadedManagerInfoHashHex}) TorrentUpdateAvailable event for mutable torrent {identifier.ToHex()}."); // Use Debug.WriteLine
                 manager.TorrentUpdateAvailable += OnTorrentUpdateAvailable;
-                // Start the torrent manager to enable active downloading/DHT interaction/update checks
-                await manager.StartAsync();
-                Console.WriteLine($"[LoadTorrentAsync] Started TorrentManager for {identifier.ToHex()}.");
-                // We don't know the sequence number or vDictionary when just loading.
-                // Modification methods will need to handle this by calling GetAndUpdateTorrentStateAsync first.
-                // Return the identifier as the handle
-                Console.WriteLine($"[LoadTorrentAsync] Completed loading for {identifier.ToHex()}.");
+                // Do not start the manager here. It will enter MetadataMode if needed
+                // and start itself once metadata is retrieved, preventing the NullRef during DHT announce.
+                System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Manager added for mutable {identifier.ToHex()}. It will start automatically after metadata retrieval if needed."); // Use Debug.WriteLine
+                System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Completed loading for {identifier.ToHex()}."); // Use Debug.WriteLine
                 return identifier;
             }
-            // If it wasn't a mutable torrent, return the standard identifier
-             Console.WriteLine($"[LoadTorrentAsync] Completed loading for standard torrent {identifier.ToHex()}.");
-             return identifier; // Ensure non-mutable path also returns
+             System.Diagnostics.Debug.WriteLine($"[LoadTorrentAsync] Completed loading for standard torrent {identifier.ToHex()}."); // Use Debug.WriteLine
+             return identifier;
         }
 
         /// <summary>
@@ -352,22 +336,26 @@ namespace TorrentWrapper
             if (!_publicKeys.ContainsKey(torrentHandle))
                 throw new InvalidOperationException($"Torrent {torrentHandle.ToHex()} is not a mutable torrent.");
 
-            Console.WriteLine($"[TriggerMutableUpdateCheckAsync] Triggering update check for {torrentHandle.ToHex()}");
+            System.Diagnostics.Debug.WriteLine($"[TriggerMutableUpdateCheckAsync] Triggering update check for {torrentHandle.ToHex()}"); // Use Debug.WriteLine
+            System.Diagnostics.Debug.WriteLine($"[TriggerMutableUpdateCheckAsync] DHT State before check: {_engine.Dht?.State ?? DhtState.NotReady}"); // Use Debug.WriteLine
             try
             {
-                // Call the new method on the TorrentManager instance
                 await manager.ForceMutableUpdateCheckAsync();
-                Console.WriteLine($"[TriggerMutableUpdateCheckAsync] Update check completed for {torrentHandle.ToHex()}");
+                System.Diagnostics.Debug.WriteLine($"[TriggerMutableUpdateCheckAsync] ForceMutableUpdateCheckAsync call completed for {torrentHandle.ToHex()}"); // Use Debug.WriteLine
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[TriggerMutableUpdateCheckAsync] Update check FAILED for {torrentHandle.ToHex()}: {ex.Message}");
-                // Decide if re-throwing is appropriate. For now, just log.
+                System.Diagnostics.Debug.WriteLine($"[TriggerMutableUpdateCheckAsync] Update check FAILED for {torrentHandle.ToHex()}: {ex.Message}"); // Use Debug.WriteLine
             }
         }
 
-        // Retrieves the public key associated with a mutable torrent handle.
-        private byte[] GetPublicKeyForTorrent(MonoTorrent.InfoHash torrentHandle)
+        /// <summary>
+        /// Retrieves the public key associated with a mutable torrent handle.
+        /// </summary>
+        /// <param name="torrentHandle">The handle of the torrent.</param>
+        /// <returns>The public key as a byte array.</returns>
+        /// <exception cref="KeyNotFoundException">Thrown if the public key for the handle is not found.</exception>
+        public byte[] GetPublicKeyForTorrent(MonoTorrent.InfoHash torrentHandle)
         {
             if (_publicKeys.TryGetValue(torrentHandle, out var publicKey))
             {
@@ -376,118 +364,130 @@ namespace TorrentWrapper
             throw new KeyNotFoundException($"Could not find public key for the torrent handle '{torrentHandle.ToHex()}'. Ensure it was created or loaded by this service.");
         }
 
-        // Helper method to get the latest state from DHT and update local cache
-        private async Task<(long sequenceNumber, MonoTorrent.BEncoding.BEncodedDictionary vDictionary)> GetAndUpdateTorrentStateAsync(MonoTorrent.InfoHash torrentHandle)
+        /// <summary>
+        /// Helper method to get the latest state from DHT and update local cache.
+        /// </summary>
+        /// <param name="torrentHandle">The handle of the torrent.</param>
+        /// <returns>A tuple containing the sequence number and the vDictionary.</returns>
+        /// <exception cref="InvalidOperationException">Thrown if the service is not initialized or state cannot be retrieved.</exception>
+        /// <exception cref="TorrentException">Thrown if the DHT Get operation fails.</exception>
+        public async Task<(long sequenceNumber, MonoTorrent.BEncoding.BEncodedDictionary vDictionary)> GetAndUpdateTorrentStateAsync(MonoTorrent.InfoHash torrentHandle)
         {
             if (_engine == null) throw new InvalidOperationException("Service not initialized.");
-
-            byte[] publicKey = GetPublicKeyForTorrent(torrentHandle); // Get the public key first
-            // Target ID for mutable items is the SHA1 hash of the public key
-            MonoTorrent.InfoHash targetId;
-            using (var sha1 = SHA1.Create()) {
-                 targetId = new MonoTorrent.InfoHash(sha1.ComputeHash(publicKey));
-            }
-            var dhtTargetId = MonoTorrent.Dht.NodeId.FromInfoHash(targetId); // Use static factory method
-
-            // Perform the DHT Get operation
-            // Qualify the GetAsync call just in case, though it shouldn't be needed.
-            (BEncodedValue? value, BEncodedString? publicKey, BEncodedString? signature, long? sequenceNumber) result;
-            try
+            if (_engine.Dht == null) throw new InvalidOperationException("DHT Service is not available.");
+ 
+            byte[] pubKeyBytes = GetPublicKeyForTorrent(torrentHandle);
+            // torrentHandle *is* the targetId (SHA1 of public key)
+            var dhtTargetId = MonoTorrent.Dht.NodeId.FromInfoHash(torrentHandle); // Convert key to NodeId for DHT lookup
+ 
+            System.Diagnostics.Debug.WriteLine($"[GetAndUpdateState] Handle/TargetID: {torrentHandle.ToHex()}, DHT Target NodeId: {dhtTargetId}"); // Use Debug.WriteLine
+            System.Diagnostics.Debug.WriteLine($"[GetAndUpdateState] DHT State: {_engine.Dht.State}"); // Use Debug.WriteLine
+ 
+            // --- START CHANGE ---
+            long? seqToRequest = null;
+            if (_mutableSequenceNumbers.TryGetValue(torrentHandle, out long knownSeq))
             {
-                 // Assuming IDht interface *does* have GetAsync in the modified source
-                 // Compiler Error CS1061 likely due to project reference issue. GetAsync should exist in modified IDht.cs.
-                 result = await _engine.Dht.GetAsync(dhtTargetId);
-            }
-            catch (Exception ex)
-            {
-                 // Compiler Error CS0103 likely due to project reference issue. TorrentException is in MonoTorrent.
-                 throw new TorrentException($"Failed to get mutable torrent state from DHT for '{torrentHandle.ToHex()}'.", ex);
-            }
-
-            BEncodedDictionary? vDict = null; // Initialize vDict
-            if (result.value is BEncodedDictionary tempVDict && result.sequenceNumber.HasValue)
-            {
-                // Update local cache with the fetched state
-                _mutableSequenceNumbers[torrentHandle] = result.sequenceNumber.Value;
-                vDict = tempVDict; // Assign the matched dictionary
-                _lastKnownVDictionary[torrentHandle] = vDict;
-                // Optional: Verify signature and public key match if needed for extra security
-                // if (!VerifySignature(publicKey, result.salt, result.sequenceNumber.Value, vDict, result.signature)) { ... }
-                return (result.sequenceNumber.Value, vDict); // Return the assigned vDict
+                seqToRequest = knownSeq; // Request items newer than what we last processed/stored
+                System.Diagnostics.Debug.WriteLine($"[GetAndUpdateState] Requesting sequence > {seqToRequest}");
             }
             else
             {
-                // Handle cases where the item wasn't found or the format was incorrect
-                // Maybe fall back to locally cached version if available? Or throw?
-                // For now, throw if we can't get the latest state.
+                 System.Diagnostics.Debug.WriteLine($"[GetAndUpdateState] No known sequence number for {torrentHandle.ToHex()}. Requesting latest.");
+            }
+            // --- END CHANGE ---
+
+            (BEncodedValue? value, BEncodedString? publicKeyResult, BEncodedString? signature, long? sequenceNumber) result;
+            try
+            {
+                 // --- MODIFIED LINE ---
+                 System.Diagnostics.Debug.WriteLine($"[GetAndUpdateState] Calling DHT GetAsync for TargetID: {dhtTargetId} with Seq: {seqToRequest?.ToString() ?? "null"}"); // Use Debug.WriteLine
+                 result = await _engine.Dht.GetAsync(dhtTargetId, seqToRequest); // Pass the sequence number
+                 // --- END MODIFIED LINE ---
+                 System.Diagnostics.Debug.WriteLine($"[GetAndUpdateState] DHT GetAsync Result - Value Found: {result.value != null}, Seq Found: {result.sequenceNumber.HasValue}, Seq: {result.sequenceNumber?.ToString() ?? "N/A"}, Sig Found: {result.signature != null}"); // Use Debug.WriteLine
+            }
+            catch (Exception ex)
+            {
+                 System.Diagnostics.Debug.WriteLine($"[GetAndUpdateState] DHT GetAsync FAILED for TargetID {dhtTargetId}: {ex.Message}\nStackTrace: {ex.StackTrace}"); // Use Debug.WriteLine
+                 throw new TorrentException($"Failed to get mutable torrent state from DHT for '{torrentHandle.ToHex()}'.", ex);
+            }
+
+            if (result.value is BEncodedDictionary vDict && result.sequenceNumber.HasValue)
+            {
+                _mutableSequenceNumbers[torrentHandle] = result.sequenceNumber.Value;
+                _lastKnownVDictionary[torrentHandle] = vDict;
+                if (result.signature != null)
+                    _lastKnownSignature[torrentHandle] = result.signature.AsMemory().ToArray();
+
+                return (result.sequenceNumber.Value, vDict);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine($"[GetAndUpdateState] Could not retrieve valid mutable state for torrent '{torrentHandle.ToHex()}' from DHT. Result Value Type: {result.value?.GetType().Name ?? "null"}, Seq HasValue: {result.sequenceNumber.HasValue}"); // Use Debug.WriteLine
                 throw new InvalidOperationException($"Could not retrieve valid mutable state for torrent '{torrentHandle.ToHex()}' from DHT.");
             }
         }
 
-        // Retrieves the BEncodedList representing the files from a given vDictionary.
-        private BEncodedList GetFileListFromVDictionary(BEncodedDictionary vDictionary) // Use using directive
+        /// <summary>
+        /// Retrieves the BEncodedList representing the files from a given vDictionary.
+        /// </summary>
+        /// <param name="vDictionary">The vDictionary containing the file list.</param>
+        /// <returns>The BEncodedList of files.</returns>
+        /// <exception cref="InvalidOperationException">Thrown if the 'files' key is not found or is not a list.</exception>
+        private BEncodedList GetFileListFromVDictionary(BEncodedDictionary vDictionary)
         {
-             if (vDictionary.TryGetValue("files", out var filesValue) && // Assuming the key is "files"
-                 filesValue is BEncodedList fileList) // Use using directive
+             if (vDictionary.TryGetValue("files", out var filesValue) && filesValue is BEncodedList fileList)
              {
                  return fileList;
              }
              throw new InvalidOperationException("Could not find 'files' list in the provided vDictionary.");
         }
 
-        // This method seems redundant now that GetAndUpdateTorrentStateAsync fetches the latest vDictionary
-        // and GetFileListFromVDictionary extracts the list from it. Removing it.
-        // private BEncodedList GetCurrentFileListBEncoding(InfoHash torrentHandle)
-        // { ... }
-        // Removed extra brace from previous diff attempt
-
         /// <summary>
-        /// Adds a file to an existing mutable torrent.
+        /// Adds a file or directory to an existing mutable torrent.
         /// </summary>
         /// <param name="torrentHandle">The handle of the torrent to modify (InfoHash of public key).</param>
-        /// <param name="filePathToAdd">Path to the file to add.</param>
+        /// <param name="pathToAdd">Path to the file or directory to add.</param>
         /// <param name="signingKeySeed">The 32-byte non-secret private key seed for signing.</param>
-        /// <returns>A task representing the asynchronous operation.</returns>
-        public async Task<long> AddFileToMutableTorrentAsync(MonoTorrent.InfoHash torrentHandle, string filePathToAdd, byte[] signingKeySeed)
+        /// <returns>The new sequence number after the update.</returns>
+        public async Task<long> AddFileToMutableTorrentAsync(MonoTorrent.InfoHash torrentHandle, string pathToAdd, byte[] signingKeySeed)
         {
-            Console.WriteLine($"[AddFileToMutableTorrentAsync] START: Adding '{Path.GetFileName(filePathToAdd)}' to torrent {torrentHandle.ToHex()}");
+            System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] START: Adding '{Path.GetFileName(pathToAdd)}' to torrent {torrentHandle.ToHex()}"); // Use Debug.WriteLine
             if (_engine == null) throw new InvalidOperationException("Service not initialized.");
             if (signingKeySeed == null || signingKeySeed.Length != 32) throw new ArgumentException("Invalid signing key seed provided.", nameof(signingKeySeed));
             if (!_managedTorrents.TryGetValue(torrentHandle, out var manager)) throw new KeyNotFoundException("Torrent handle not found or torrent is not managed.");
             if (!_publicKeys.TryGetValue(torrentHandle, out var publicKey)) throw new InvalidOperationException($"Torrent {torrentHandle.ToHex()} is not a known mutable torrent.");
-            if (!_mutableSequenceNumbers.TryGetValue(torrentHandle, out var currentSequenceNumber)) throw new InvalidOperationException($"Current sequence number not found for mutable torrent {torrentHandle.ToHex()}.");
-            if (!_lastKnownVDictionary.TryGetValue(torrentHandle, out var currentVDictionary)) throw new InvalidOperationException($"Last known vDictionary not found for mutable torrent {torrentHandle.ToHex()}.");
 
-            // --- Use Locally Cached State ---
-            // byte[] publicKey is retrieved above
-            MonoTorrent.BEncoding.BEncodedList currentFileList;
+            long currentSequenceNumber;
+            BEncodedDictionary currentVDictionary;
+            if (_mutableSequenceNumbers.TryGetValue(torrentHandle, out currentSequenceNumber) && _lastKnownVDictionary.TryGetValue(torrentHandle, out currentVDictionary))
+            {
+                System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] Using cached state Seq: {currentSequenceNumber}"); // Use Debug.WriteLine
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] Fetching current state from DHT for {torrentHandle.ToHex()}..."); // Use Debug.WriteLine
+                (currentSequenceNumber, currentVDictionary) = await GetAndUpdateTorrentStateAsync(torrentHandle);
+                System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] Fetched state Seq: {currentSequenceNumber}"); // Use Debug.WriteLine
+            }
+
+            BEncodedList currentFileList;
             try
             {
                 currentFileList = GetFileListFromVDictionary(currentVDictionary);
             }
             catch (Exception ex)
             {
-                throw new InvalidOperationException($"Could not parse file list from cached vDictionary for torrent {torrentHandle.ToHex()}.", ex);
+                throw new InvalidOperationException($"Could not parse file list from vDictionary for torrent {torrentHandle.ToHex()}.", ex);
             }
-
-            // Extract piece length and name from the fetched vDictionary
             int pieceLength = (int)((MonoTorrent.BEncoding.BEncodedNumber)currentVDictionary["piece length"]).Number;
             string torrentName = ((MonoTorrent.BEncoding.BEncodedString)currentVDictionary["name"]).Text;
 
-            // --- Prepare New State ---
             long nextSequenceNumber = currentSequenceNumber + 1;
+            var newFileSource = new MonoTorrent.TorrentFileSource(pathToAdd);
+            var newFileListBEncoded = new MonoTorrent.BEncoding.BEncodedList(currentFileList);
 
-            // Create source for the new file or directory
-            var newFileSource = new MonoTorrent.TorrentFileSource(filePathToAdd);
-            // The TorrentFileSource handles both single files and directories.
-            // We will iterate through all files discovered by it.
-
-            // Construct the new file list BEncoding
-            var newFileListBEncoded = new MonoTorrent.BEncoding.BEncodedList(currentFileList); // Copy existing list
             foreach (var newFileMapping in newFileSource.Files)
             {
-                 // Check if a file with the exact same path already exists. If so, skip adding it.
-                 // A more robust implementation might replace the existing entry, but for now, skipping avoids duplicates.
                  bool alreadyExists = currentFileList.Cast<MonoTorrent.BEncoding.BEncodedDictionary>()
                      .Any(existingDict =>
                          existingDict.TryGetValue("path", out var pathValue) && pathValue is MonoTorrent.BEncoding.BEncodedList pathList &&
@@ -499,110 +499,90 @@ namespace TorrentWrapper
                      newFileListBEncoded.Add(new MonoTorrent.BEncoding.BEncodedDictionary {
                          { "path", new MonoTorrent.BEncoding.BEncodedList(newFileMapping.Destination.Parts.ToArray().Select(s => (MonoTorrent.BEncoding.BEncodedString)s)) },
                          { "length", new MonoTorrent.BEncoding.BEncodedNumber(newFileMapping.Length) }
-                         // Add attributes if needed: { "attr", (MonoTorrent.BEncoding.BEncodedString)"x" }
                      });
                  } else {
-                      Console.WriteLine($"[AddFileToMutableTorrentAsync] Skipped adding duplicate path: {newFileMapping.Destination}");
+                      System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] Skipped adding duplicate path: {newFileMapping.Destination}"); // Use Debug.WriteLine
                  }
             }
 
-            // --- Construct New vDictionary ---
             var newVDictionary = new MonoTorrent.BEncoding.BEncodedDictionary {
                 { "name", (MonoTorrent.BEncoding.BEncodedString)torrentName },
                 { "piece length", new MonoTorrent.BEncoding.BEncodedNumber(pieceLength) },
-                { "files", newFileListBEncoded } // Assuming "files" list format
+                { "files", newFileListBEncoded }
             };
-            var encodedNewVDictionary = newVDictionary.Encode();
 
-            // --- Sign New State ---
-            // Construct data to sign according to BEP44: "salt" + salt + "seq" + seq + "v" + value
-            // Salt is omitted here. Sequence number MUST be BEncoded.
-            var seqKey = new BEncodedString("seq");
-            var seqValue = new BEncodedNumber(nextSequenceNumber);
-            var vKey = new BEncodedString("v");
+            byte[] dataToSign = ConstructDataToSign(nextSequenceNumber, newVDictionary);
+            byte[] newSignature = SignData(dataToSign, signingKeySeed);
 
-            // Calculate total length
-            int totalLength = seqKey.LengthInBytes() + seqValue.LengthInBytes() + vKey.LengthInBytes() + encodedNewVDictionary.Length;
-            var dataToSign = new byte[totalLength];
-
-            // Encode into the buffer
-            int offset = 0;
-            offset += seqKey.Encode(dataToSign.AsSpan(offset));
-            offset += seqValue.Encode(dataToSign.AsSpan(offset));
-            offset += vKey.Encode(dataToSign.AsSpan(offset));
-            offset += newVDictionary.Encode(dataToSign.AsSpan(offset)); // Encode the dictionary itself
-
-            var signer = new BCrypt::Org.BouncyCastle.Crypto.Signers.Ed25519Signer();
-            var signingPrivateKeyParams = new BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519PrivateKeyParameters(signingKeySeed);
-            signer.Init(true, signingPrivateKeyParams);
-            signer.BlockUpdate(dataToSign, 0, dataToSign.Length);
-            byte[] newSignature = signer.GenerateSignature();
-
-            // --- Perform DHT Put ---
             try
             {
-                 Console.WriteLine($"[AddFileToMutableTorrentAsync] Attempting DHT Put for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}");
+                 System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] Attempting DHT Put for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}"); // Use Debug.WriteLine
                  await _engine.Dht.PutMutableAsync(
                     publicKey: (BEncodedString)publicKey,
-                    salt: null, // Salt is optional
+                    salt: null,
                     value: newVDictionary,
                     sequenceNumber: nextSequenceNumber,
                     signature: (BEncodedString)newSignature
                 );
-                Console.WriteLine($"[AddFileToMutableTorrentAsync] DHT Put successful for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}");
+                System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] DHT Put successful for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}"); // Use Debug.WriteLine
             }
             catch (Exception ex)
             {
-                 // Compiler Error CS0103 likely due to project reference issue. TorrentException is in MonoTorrent.
-                 Console.WriteLine($"[AddFileToMutableTorrentAsync] DHT Put FAILED for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}: {ex.Message}");
+                 System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] DHT Put FAILED for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}: {ex.Message}"); // Use Debug.WriteLine
                  throw new TorrentException($"Failed to put mutable torrent update (AddFile) to DHT for '{torrentHandle.ToHex()}'.", ex);
             }
 
-            // --- Update Local State ---
-            _mutableSequenceNumbers[torrentHandle] = nextSequenceNumber; // Update local sequence number
-            _lastKnownVDictionary[torrentHandle] = newVDictionary; // Update local vDictionary cache
-            Console.WriteLine($"[AddFileToMutableTorrentAsync] END: Completed for {torrentHandle.ToHex()}, returning Seq: {nextSequenceNumber}");
+            _mutableSequenceNumbers[torrentHandle] = nextSequenceNumber;
+            _lastKnownVDictionary[torrentHandle] = newVDictionary;
+            _lastKnownSignature[torrentHandle] = newSignature;
+            System.Diagnostics.Debug.WriteLine($"[AddFileToMutableTorrentAsync] END: Completed for {torrentHandle.ToHex()}, returning Seq: {nextSequenceNumber}"); // Use Debug.WriteLine
             return nextSequenceNumber;
         }
 
         /// <summary>
-        /// Removes a file from an existing mutable torrent.
+        /// Removes a file or directory from an existing mutable torrent.
         /// </summary>
         /// <param name="torrentHandle">The handle of the torrent to modify.</param>
-        /// <param name="filePathToRemove">Path of the file to remove (relative to torrent root).</param>
-        /// <param name="torrentPrivateKey">The non-secret private key for the mutable torrent.</param>
-        /// <returns>A task representing the asynchronous operation.</returns>
-        public async Task<long> RemoveFileFromMutableTorrentAsync(MonoTorrent.InfoHash torrentHandle, string filePathToRemove, byte[] signingKeySeed)
+        /// <param name="pathToRemove">Path of the file or directory to remove (relative to torrent root).</param>
+        /// <param name="signingKeySeed">The 32-byte non-secret private key seed for signing.</param>
+        /// <returns>The new sequence number after the update.</returns>
+        public async Task<long> RemoveFileFromMutableTorrentAsync(MonoTorrent.InfoHash torrentHandle, string pathToRemove, byte[] signingKeySeed)
         {
-            Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] START: Removing '{filePathToRemove}' from torrent {torrentHandle.ToHex()}");
+            System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] START: Removing '{pathToRemove}' from torrent {torrentHandle.ToHex()}"); // Use Debug.WriteLine
 
             if (_engine == null) throw new InvalidOperationException("Service not initialized.");
             if (signingKeySeed == null || signingKeySeed.Length != 32) throw new ArgumentException("Invalid signing key seed provided.", nameof(signingKeySeed));
             if (!_managedTorrents.TryGetValue(torrentHandle, out var manager)) throw new KeyNotFoundException("Torrent handle not found or torrent is not managed.");
             if (!_publicKeys.TryGetValue(torrentHandle, out var publicKey)) throw new InvalidOperationException($"Torrent {torrentHandle.ToHex()} is not a known mutable torrent.");
-            if (!_mutableSequenceNumbers.TryGetValue(torrentHandle, out var currentSequenceNumber)) throw new InvalidOperationException($"Current sequence number not found for mutable torrent {torrentHandle.ToHex()}.");
-            if (!_lastKnownVDictionary.TryGetValue(torrentHandle, out var currentVDictionary)) throw new InvalidOperationException($"Last known vDictionary not found for mutable torrent {torrentHandle.ToHex()}.");
 
-            // --- Use Locally Cached State ---
-            // byte[] publicKey is retrieved above
-            MonoTorrent.BEncoding.BEncodedList currentFileList;
+            long currentSequenceNumber;
+            BEncodedDictionary currentVDictionary;
+             if (_mutableSequenceNumbers.TryGetValue(torrentHandle, out currentSequenceNumber) && _lastKnownVDictionary.TryGetValue(torrentHandle, out currentVDictionary))
+            {
+                System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] Using cached state Seq: {currentSequenceNumber}"); // Use Debug.WriteLine
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] Fetching current state from DHT for {torrentHandle.ToHex()}..."); // Use Debug.WriteLine
+                (currentSequenceNumber, currentVDictionary) = await GetAndUpdateTorrentStateAsync(torrentHandle);
+                System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] Fetched state Seq: {currentSequenceNumber}"); // Use Debug.WriteLine
+            }
+
+            BEncodedList currentFileList;
              try
             {
                 currentFileList = GetFileListFromVDictionary(currentVDictionary);
             }
             catch (Exception ex)
             {
-                throw new InvalidOperationException($"Could not parse file list from cached vDictionary for torrent {torrentHandle.ToHex()}.", ex);
+                throw new InvalidOperationException($"Could not parse file list from vDictionary for torrent {torrentHandle.ToHex()}.", ex);
             }
             int pieceLength = (int)((MonoTorrent.BEncoding.BEncodedNumber)currentVDictionary["piece length"]).Number;
             string torrentName = ((MonoTorrent.BEncoding.BEncodedString)currentVDictionary["name"]).Text;
 
-            // --- Prepare New State ---
             long nextSequenceNumber = currentSequenceNumber + 1;
-            // Split the input path by both '/' and '\' to handle potential OS differences, removing empty entries
-            var pathToRemoveParts = filePathToRemove.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
-            Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] Trying to remove path: {filePathToRemove} (Parsed as: [{string.Join(", ", pathToRemoveParts)}])");
-
+            var pathToRemoveParts = pathToRemove.Split(new[] { '/', '\\' }, StringSplitOptions.RemoveEmptyEntries);
+            System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] Trying to remove path: {pathToRemove} (Parsed as: [{string.Join(", ", pathToRemoveParts)}])"); // Use Debug.WriteLine
 
             var newFileListBEncoded = new MonoTorrent.BEncoding.BEncodedList();
             bool removedSomething = false;
@@ -611,76 +591,47 @@ namespace TorrentWrapper
                 if (item.TryGetValue("path", out var pathValue) && pathValue is MonoTorrent.BEncoding.BEncodedList pathList)
                 {
                     var pathParts = pathList.Cast<MonoTorrent.BEncoding.BEncodedString>().Select(s => s.Text).ToArray();
-                    Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] Checking against path: [{string.Join(", ", pathParts)}]");
+                    System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] Checking against path: [{string.Join(", ", pathParts)}]"); // Use Debug.WriteLine
 
-
-                    // Check if the item's path starts with the path to remove.
-                    // This handles removing both single files and entire directories.
                     bool isMatchOrSubPath = pathParts.Length >= pathToRemoveParts.Length &&
                                             pathParts.Take(pathToRemoveParts.Length).SequenceEqual(pathToRemoveParts);
 
                     if (!isMatchOrSubPath)
                     {
-                        Console.WriteLine("[RemoveFileFromMutableTorrentAsync] -> No match, keeping.");
-
-                        newFileListBEncoded.Add(item); // Keep items that don't match
+                        System.Diagnostics.Debug.WriteLine("[RemoveFileFromMutableTorrentAsync] -> No match, keeping."); // Use Debug.WriteLine
+                        newFileListBEncoded.Add(item);
                     } else {
-                        Console.WriteLine("[RemoveFileFromMutableTorrentAsync] -> Match found, removing.");
-
-                        removedSomething = true; // Mark that we found something to remove
+                        System.Diagnostics.Debug.WriteLine("[RemoveFileFromMutableTorrentAsync] -> Match found, removing."); // Use Debug.WriteLine
+                        removedSomething = true;
                     }
                 }
                 else
                 {
-                     // Keep items that don't have a valid path structure? Or log an error?
-                     // For now, let's keep them to be safe.
                      newFileListBEncoded.Add(item);
                 }
             }
 
             if (!removedSomething)
             {
-                 Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] Warning: Path '{filePathToRemove}' not found in torrent {torrentHandle.ToHex()}. No changes made to file list.");
-                 // Optionally throw an exception here if the path *must* exist for removal
-                 // throw new KeyNotFoundException($"Path '{filePathToRemove}' not found in the torrent.");
+                 System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] Warning: Path '{pathToRemove}' not found in torrent {torrentHandle.ToHex()}. No changes made to file list."); // Use Debug.WriteLine
+                 // If nothing was removed, we don't need to update the DHT. Return the current sequence number.
+                 // However, the logic below will still proceed and bump the sequence number.
+                 // Decide if this is the desired behavior (bump seq even if no change) or return early.
+                 // For simplicity, let's proceed and bump the sequence number.
             }
 
-            // --- Construct New vDictionary ---
-             var newVDictionary = new MonoTorrent.BEncoding.BEncodedDictionary {
+            var newVDictionary = new MonoTorrent.BEncoding.BEncodedDictionary {
                 { "name", (MonoTorrent.BEncoding.BEncodedString)torrentName },
                 { "piece length", new MonoTorrent.BEncoding.BEncodedNumber(pieceLength) },
                 { "files", newFileListBEncoded }
             };
-            var encodedNewVDictionary = newVDictionary.Encode();
 
-            // --- Sign New State ---
-            // Construct data to sign according to BEP44: "salt" + salt + "seq" + seq + "v" + value
-            // Salt is omitted here. Sequence number MUST be BEncoded.
-            var seqKey = new BEncodedString("seq");
-            var seqValue = new BEncodedNumber(nextSequenceNumber);
-            var vKey = new BEncodedString("v");
+            byte[] dataToSign = ConstructDataToSign(nextSequenceNumber, newVDictionary);
+            byte[] newSignature = SignData(dataToSign, signingKeySeed);
 
-            // Calculate total length
-            int totalLength = seqKey.LengthInBytes() + seqValue.LengthInBytes() + vKey.LengthInBytes() + encodedNewVDictionary.Length;
-            var dataToSign = new byte[totalLength];
-
-            // Encode into the buffer
-            int offset = 0;
-            offset += seqKey.Encode(dataToSign.AsSpan(offset));
-            offset += seqValue.Encode(dataToSign.AsSpan(offset));
-            offset += vKey.Encode(dataToSign.AsSpan(offset));
-            offset += newVDictionary.Encode(dataToSign.AsSpan(offset)); // Encode the dictionary itself
-
-            var signer = new BCrypt::Org.BouncyCastle.Crypto.Signers.Ed25519Signer();
-            var signingPrivateKeyParams = new BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519PrivateKeyParameters(signingKeySeed);
-            signer.Init(true, signingPrivateKeyParams);
-            signer.BlockUpdate(dataToSign, 0, dataToSign.Length);
-            byte[] newSignature = signer.GenerateSignature();
-
-            // --- Perform DHT Put ---
             try
             {
-                 Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] Attempting DHT Put for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}");
+                 System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] Attempting DHT Put for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}"); // Use Debug.WriteLine
                  await _engine.Dht.PutMutableAsync(
                     publicKey: (BEncodedString)publicKey,
                     salt: null,
@@ -688,19 +639,18 @@ namespace TorrentWrapper
                     sequenceNumber: nextSequenceNumber,
                     signature: (BEncodedString)newSignature
                 );
-                Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] DHT Put successful for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}");
+                System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] DHT Put successful for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}"); // Use Debug.WriteLine
             }
             catch (Exception ex)
             {
-                 // Compiler Error CS0103 likely due to project reference issue. TorrentException is in MonoTorrent.
-                 Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] DHT Put FAILED for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}: {ex.Message}");
+                 System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] DHT Put FAILED for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}: {ex.Message}"); // Use Debug.WriteLine
                  throw new TorrentException($"Failed to put mutable torrent update (RemoveFile) to DHT for '{torrentHandle.ToHex()}'.", ex);
             }
 
-            // --- Update Local State ---
-            _mutableSequenceNumbers[torrentHandle] = nextSequenceNumber; // Update local sequence number
-            _lastKnownVDictionary[torrentHandle] = newVDictionary; // Update local vDictionary cache
-            Console.WriteLine($"[RemoveFileFromMutableTorrentAsync] END: Completed for {torrentHandle.ToHex()}, returning Seq: {nextSequenceNumber}");
+            _mutableSequenceNumbers[torrentHandle] = nextSequenceNumber;
+            _lastKnownVDictionary[torrentHandle] = newVDictionary;
+            _lastKnownSignature[torrentHandle] = newSignature;
+            System.Diagnostics.Debug.WriteLine($"[RemoveFileFromMutableTorrentAsync] END: Completed for {torrentHandle.ToHex()}, returning Seq: {nextSequenceNumber}"); // Use Debug.WriteLine
             return nextSequenceNumber;
         }
 
@@ -714,10 +664,89 @@ namespace TorrentWrapper
         /// <returns>A task representing the asynchronous operation.</returns>
         public async Task UpdateFileInMutableTorrentAsync(MonoTorrent.InfoHash torrentHandle, string filePathToUpdate, string newFilePath, byte[] signingKeySeed)
         {
-            // Note: This simplified remove+add approach will now correctly fetch state between operations via GetAndUpdateTorrentStateAsync.
-            // A single-step update would still be more efficient (one DHT put instead of two).
+            // Note: This simplified version increments sequence number twice.
+            // A more optimized version would combine remove and add logic into one DHT Put.
             await RemoveFileFromMutableTorrentAsync(torrentHandle, filePathToUpdate, signingKeySeed);
             await AddFileToMutableTorrentAsync(torrentHandle, newFilePath, signingKeySeed);
+        }
+
+        /// <summary>
+        /// Updates the BEncodedDictionary data for an existing mutable torrent.
+        /// </summary>
+        /// <param name="torrentHandle">The handle of the torrent to modify (InfoHash of public key).</param>
+        /// <param name="newVDictionary">The new BEncodedDictionary representing the torrent state.</param>
+        /// <param name="signingKeySeed">The 32-byte non-secret private key seed for signing.</param>
+        /// <param name="salt">Optional salt used when creating/joining the torrent.</param>
+        /// <returns>The new sequence number after the update.</returns>
+        public async Task<long> UpdateMutableDataAsync(InfoHash torrentHandle, BEncodedDictionary newVDictionary, byte[] signingKeySeed, byte[]? salt = null)
+        {
+            System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] START: Updating data for torrent {torrentHandle.ToHex()}"); // Use Debug.WriteLine
+            if (_engine == null) throw new InvalidOperationException("Service not initialized.");
+            if (signingKeySeed == null || signingKeySeed.Length != 32) throw new ArgumentException("Invalid signing key seed provided.", nameof(signingKeySeed));
+            if (!_managedTorrents.TryGetValue(torrentHandle, out var manager)) throw new KeyNotFoundException("Torrent handle not found or torrent is not managed.");
+            if (!_publicKeys.TryGetValue(torrentHandle, out var publicKey)) throw new InvalidOperationException($"Torrent {torrentHandle.ToHex()} is not a known mutable torrent.");
+
+            // Fetch the latest state *first* to get the sequence number for CAS
+            long latestSequenceNumber;
+            BEncodedDictionary latestVDictionary;
+            try
+            {
+                 System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] Fetching latest state for CAS for {torrentHandle.ToHex()}..."); // Use Debug.WriteLine
+                 (latestSequenceNumber, latestVDictionary) = await GetAndUpdateTorrentStateAsync(torrentHandle); // This updates local cache too
+                 System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] Fetched latest state for CAS. Seq: {latestSequenceNumber}"); // Use Debug.WriteLine
+            }
+            catch (Exception ex)
+            {
+                 System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] Failed to fetch latest state for CAS for {torrentHandle.ToHex()}: {ex.Message}. Aborting Put."); // Use Debug.WriteLine
+                 throw new TorrentException($"Failed to fetch latest state before Put for '{torrentHandle.ToHex()}'.", ex);
+            }
+
+            // Now modify the dictionary *based on the latest fetched state*
+            // It's crucial that newVDictionary is based on the *actual* latest state,
+            // otherwise the CAS might succeed but data loss could still occur if the
+            // caller didn't provide a dictionary derived from the latest state.
+            // For the chat example, the caller *does* fetch before calling this,
+            // but this CAS adds an extra layer of safety.
+            // We will proceed assuming the caller provided a correctly updated newVDictionary
+            // based on the state they fetched just before calling this method.
+
+            long nextSequenceNumber = latestSequenceNumber + 1;
+            BEncodedString? saltBEncoded = salt == null ? null : (BEncodedString)salt;
+
+            byte[] dataToSign = ConstructDataToSign(nextSequenceNumber, newVDictionary, saltBEncoded);
+            byte[] newSignature = SignData(dataToSign, signingKeySeed);
+
+            var pubKeyBencoded = (BEncodedString)publicKey; // Reuse for logging and Put
+            var sigBencoded = (BEncodedString)newSignature; // Reuse for logging and Put
+            // Note: PutMutableAsync uses the public key directly, not its hash, for internal routing/storage mapping.
+            System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] Preparing DHT Put for PubKey: {pubKeyBencoded.ToHex()} | TargetID (PubKeyHash): {torrentHandle.ToHex()} | Seq: {nextSequenceNumber} | Salt: {saltBEncoded?.ToHex() ?? "null"} | Sig: {sigBencoded.ToHex()} | VDict Keys: {string.Join(",", newVDictionary.Keys.Select(k => k.Text))}"); // Use Debug.WriteLine
+ 
+            try
+            {
+                 System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] Calling DHT PutMutableAsync..."); // Use Debug.WriteLine
+                 // Use the fetched latestSequenceNumber as the CAS value
+                 await _engine.Dht.PutMutableAsync(
+                    publicKey: pubKeyBencoded,
+                    salt: saltBEncoded,
+                    value: newVDictionary,
+                    sequenceNumber: nextSequenceNumber,
+                    signature: sigBencoded,
+                    cas: latestSequenceNumber // Add CAS parameter
+                );
+                System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] DHT PutMutableAsync successful for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}"); // Use Debug.WriteLine
+            }
+            catch (Exception ex)
+            {
+                 System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] DHT PutMutableAsync FAILED for {torrentHandle.ToHex()} | Seq: {nextSequenceNumber}: {ex.Message}\nStackTrace: {ex.StackTrace}"); // Use Debug.WriteLine
+                 throw new TorrentException($"Failed to put mutable torrent update (UpdateData) to DHT for '{torrentHandle.ToHex()}'.", ex);
+            }
+
+            _mutableSequenceNumbers[torrentHandle] = nextSequenceNumber;
+            _lastKnownVDictionary[torrentHandle] = newVDictionary;
+            _lastKnownSignature[torrentHandle] = newSignature;
+ 
+            System.Diagnostics.Debug.WriteLine($"[UpdateMutableDataAsync] END: Completed for {torrentHandle.ToHex()}, returning Seq: {nextSequenceNumber}"); // Use Debug.WriteLine
+            return nextSequenceNumber;
         }
 
         /// <summary>
@@ -725,51 +754,35 @@ namespace TorrentWrapper
         /// </summary>
         /// <param name="torrentHandle">The handle of the torrent.</param>
         /// <returns>A list of file paths relative to the torrent root.</returns>
-        public Task<IEnumerable<string>> GetTorrentFilesAsync(InfoHash torrentHandle) // Restore Task return type
+        public Task<IEnumerable<string>> GetTorrentFilesAsync(InfoHash torrentHandle)
         {
              if (!_managedTorrents.TryGetValue(torrentHandle, out var manager))
             {
                 throw new KeyNotFoundException("Torrent handle not found or torrent is not managed.");
             }
 
-            // Ensure torrent metadata is available
             if (manager.Torrent == null)
             {
-                // Metadata might still be downloading, especially if loaded from magnet link
-                // We could wait for it: await manager.WaitForMetadataAsync();
-                // Or return empty / throw depending on desired behavior.
-                // Throwing for now, as accessing .Files would fail anyway.
                 throw new InvalidOperationException("Torrent metadata not yet available.");
             }
-
-            // Return the paths from the Torrent object's file list
-            // Note: This reflects the state based on the *loaded* torrent metadata.
-            // For mutable torrents, this might not reflect the *absolute latest* state from DHT
-            // until an update is processed by the engine.
-            return Task.FromResult(manager.Torrent.Files.Select(f => f.Path.ToString())); // Return Task
+            return Task.FromResult(manager.Torrent.Files.Select(f => f.Path.ToString()));
         }
 
         // Event handler for TorrentManager's update event
-        // Compiler Error CS0103 likely due to project reference issue. TorrentUpdateEventArgs is in MonoTorrent.Client.
         private void OnTorrentUpdateAvailable(object? sender, TorrentUpdateEventArgs e)
         {
-            Console.WriteLine($"[TorrentService {this.GetHashCode()}] Entered OnTorrentUpdateAvailable."); // Log entry
-            // Enhanced Logging
+            System.Diagnostics.Debug.WriteLine($"[TorrentService {this.GetHashCode()}] Entered OnTorrentUpdateAvailable."); // Use Debug.WriteLine
             string senderType = sender?.GetType().Name ?? "null";
-            string newInfoHashHex = e.NewInfoHash?.ToHex() ?? "null"; // Safely access NewInfoHash
-            Console.WriteLine($"[OnTorrentUpdateAvailable] Event received. Sender Type: {senderType}, NewInfoHash: {newInfoHashHex}");
-
-            // The sender is the TorrentManager which raised the event.
+            string newInfoHashHex = e.NewInfoHash?.ToHex() ?? "null";
+            System.Diagnostics.Debug.WriteLine($"[OnTorrentUpdateAvailable] Event received. Sender Type: {senderType}, NewInfoHash: {newInfoHashHex}"); // Use Debug.WriteLine
+ 
             if (sender is TorrentManager manager)
             {
-                // Get the original identifier (public key hash) we stored for this manager.
-                // We need to find the key in _managedTorrents whose value is 'manager'.
                 InfoHash? originalInfoHash = null;
                 foreach (var kvp in _managedTorrents)
                 {
                     if (kvp.Value == manager)
                     {
-                        // Check if this is actually a mutable torrent we track by public key hash
                         if (_publicKeys.ContainsKey(kvp.Key))
                         {
                             originalInfoHash = kvp.Key;
@@ -778,54 +791,299 @@ namespace TorrentWrapper
                     }
                 }
 
-                Console.WriteLine($"[OnTorrentUpdateAvailable] Found OriginalInfoHash: {originalInfoHash?.ToHex() ?? "null"} for Manager: {manager?.InfoHashes?.V1OrV2?.ToHex() ?? "N/A"}");
+                System.Diagnostics.Debug.WriteLine($"[OnTorrentUpdateAvailable] Found OriginalInfoHash: {originalInfoHash?.ToHex() ?? "null"} for Manager: {manager?.InfoHashes?.V1OrV2?.ToHex() ?? "N/A"}"); // Use Debug.WriteLine
                 if (originalInfoHash != null)
                  {
-                     // Ensure NewInfoHash is not null before creating args
                      if (e.NewInfoHash != null)
                      {
-                         // Create the new event args with both original and new InfoHash
                          var customArgs = new MutableTorrentUpdateInfoEventArgs(originalInfoHash, e.NewInfoHash);
-                         // Re-raise the event from this service using the custom args
-                         Console.WriteLine($"[OnTorrentUpdateAvailable] Invoking MutableTorrentUpdateAvailable for {originalInfoHash.ToHex()} -> {customArgs.NewInfoHash.ToHex()}");
+                         System.Diagnostics.Debug.WriteLine($"[OnTorrentUpdateAvailable] Invoking MutableTorrentUpdateAvailable for {originalInfoHash.ToHex()} -> {customArgs.NewInfoHash.ToHex()}"); // Use Debug.WriteLine
                          MutableTorrentUpdateAvailable?.Invoke(this, customArgs);
                      }
                      else
                      {
-                         Console.WriteLine($"[OnTorrentUpdateAvailable] Warning: NewInfoHash was null for OriginalInfoHash {originalInfoHash.ToHex()}. Cannot invoke event.");
+                         System.Diagnostics.Debug.WriteLine($"[OnTorrentUpdateAvailable] Warning: NewInfoHash was null for OriginalInfoHash {originalInfoHash.ToHex()}. Cannot invoke event."); // Use Debug.WriteLine
                      }
                  }
                  else
                 {
-                    // Log or handle the case where the original infohash couldn't be found for the manager
-                    // This case should not happen if subscription logic is correct, but log just in case.
-                    Console.WriteLine($"[OnTorrentUpdateAvailable] Warning: Could not find OriginalInfoHash for sender manager {manager.InfoHashes.V1OrV2.ToHex()}.");
+                    System.Diagnostics.Debug.WriteLine($"[OnTorrentUpdateAvailable] Warning: Could not find OriginalInfoHash for sender manager {manager.InfoHashes.V1OrV2.ToHex()}."); // Use Debug.WriteLine
                 }
             }
         }
 
-        // TODO: Add more event handlers as needed (e.g., StateChanged, PeersFound)
+        /// <summary>
+        /// Joins a shared mutable torrent based on a predefined seed, creating it if it doesn't exist.
+        /// </summary>
+        /// <param name="sharedTorrentName">A descriptive name for the shared torrent (used if creating).</param>
+        /// <param name="sharedSeed">The 32-byte private key seed unique to this shared torrent.</param>
+        /// <param name="savePath">The directory to save torrent data.</param>
+        /// <param name="salt">Optional salt for the mutable torrent (BEP46).</param>
+        /// <returns>The InfoHash identifier (SHA1 of public key) for the shared torrent.</returns>
+        public async Task<InfoHash> JoinOrCreateMutableTorrentAsync(string sharedTorrentName, byte[] sharedSeed, string savePath, byte[]? salt = null)
+        {
+            if (_engine == null) throw new InvalidOperationException("Service not initialized.");
+            if (sharedSeed == null || sharedSeed.Length != 32) throw new ArgumentException("Shared seed must be 32 bytes.", nameof(sharedSeed));
+            if (salt != null && salt.Length > 64) throw new ArgumentException("Salt cannot be longer than 64 bytes", nameof(salt));
+            if (string.IsNullOrEmpty(savePath)) throw new ArgumentNullException(nameof(savePath));
+            Directory.CreateDirectory(savePath);
+
+            byte[] publicKey = GetPublicKeyFromSeed(sharedSeed);
+            InfoHash targetId = CalculateInfoHash(publicKey);
+            BEncodedString? saltBEncoded = salt == null ? null : (BEncodedString)salt;
+            string publicKeyHex = Convert.ToHexString(publicKey).ToLowerInvariant();
+
+            System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Torrent: '{sharedTorrentName}', TargetID: {targetId.ToHex()}"); // Use Debug.WriteLine
+
+            if (_managedTorrents.ContainsKey(targetId))
+            {
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Already managing {targetId.ToHex()}."); // Use Debug.WriteLine
+                return targetId;
+            }
+
+            (BEncodedValue? value, BEncodedString? publicKey, BEncodedString? signature, long? sequenceNumber) dhtResult;
+            BEncodedDictionary? vDictionary = null;
+            long currentSequenceNumber = -1;
+            byte[]? currentSignature = null;
+
+            try
+            {
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Attempting DHT Get for {targetId.ToHex()}..."); // Use Debug.WriteLine
+                var dhtTarget = MonoTorrent.Dht.DhtEngine.CalculateMutableTargetId((BEncodedString)publicKey, saltBEncoded);
+                dhtResult = await _engine.Dht.GetAsync(dhtTarget);
+
+                if (dhtResult.value is BEncodedDictionary dict && dhtResult.sequenceNumber.HasValue)
+                {
+                    vDictionary = dict;
+                    currentSequenceNumber = dhtResult.sequenceNumber.Value;
+                    currentSignature = dhtResult.signature?.AsMemory().ToArray();
+                    System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Found existing state on DHT. Seq: {currentSequenceNumber}"); // Use Debug.WriteLine
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] State not found on DHT."); // Use Debug.WriteLine
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] DHT Get failed for {targetId.ToHex()}: {ex.Message}. Assuming torrent needs creation."); // Use Debug.WriteLine
+            }
+
+            TorrentManager manager;
+            MagnetLink magnetLink;
+
+            if (vDictionary != null && currentSequenceNumber >= 0 && currentSignature != null)
+            {
+                string nameFromDht = sharedTorrentName;
+                if (vDictionary.TryGetValue("name", out var nameVal) && nameVal is BEncodedString nameStr)
+                {
+                    nameFromDht = nameStr.Text;
+                }
+                magnetLink = new MagnetLink(publicKeyHex, salt == null ? null : Convert.ToHexString(salt).ToLowerInvariant(), name: nameFromDht);
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Loading existing torrent using Magnet: {magnetLink}"); // Use Debug.WriteLine
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("[JoinOrCreateMutable] Creating new torrent state (Seq 0)."); // Use Debug.WriteLine
+                currentSequenceNumber = 0;
+                int pieceLength = CalculatePieceLength(0);
+
+                vDictionary = new BEncodedDictionary {
+                    { "name", (BEncodedString)sharedTorrentName },
+                    { "piece length", new BEncodedNumber(pieceLength) },
+                    { "files", new BEncodedList() }
+                };
+
+                byte[] dataToSign = ConstructDataToSign(currentSequenceNumber, vDictionary, saltBEncoded);
+                currentSignature = SignData(dataToSign, sharedSeed);
+
+                try
+                {
+                    System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Attempting initial DHT Put for {targetId.ToHex()} | Seq: {currentSequenceNumber}"); // Use Debug.WriteLine
+                    await _engine.Dht.PutMutableAsync(
+                        publicKey: (BEncodedString)publicKey,
+                        salt: saltBEncoded,
+                        value: vDictionary,
+                        sequenceNumber: currentSequenceNumber,
+                        signature: (BEncodedString)currentSignature
+                    );
+                    System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Initial DHT Put successful for {targetId.ToHex()}"); // Use Debug.WriteLine
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Initial DHT Put FAILED for {targetId.ToHex()}: {ex.Message}"); // Use Debug.WriteLine
+                    throw new TorrentException($"Failed to put initial shared torrent data to DHT for '{targetId.ToHex()}'.", ex);
+                }
+ 
+                magnetLink = new MagnetLink(publicKeyHex, salt == null ? null : Convert.ToHexString(salt).ToLowerInvariant(), name: sharedTorrentName);
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Created new torrent using Magnet: {magnetLink}"); // Use Debug.WriteLine
+            }
+
+            try
+            {
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Attempting Engine.AddAsync for {targetId.ToHex()}..."); // Use Debug.WriteLine
+                // Prevent manager from interacting with DHT initially for mutable torrents
+                var settingsBuilder913 = new TorrentSettingsBuilder();
+                settingsBuilder913.AllowDht = false;
+                manager = await _engine.AddAsync(magnetLink, savePath, settingsBuilder913.ToSettings());
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Engine.AddAsync successful for {targetId.ToHex()}. Manager State: {manager?.State}"); // Use Debug.WriteLine
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Engine.AddAsync FAILED for {targetId.ToHex()}: {ex.Message}"); // Use Debug.WriteLine
+                throw new TorrentException($"Failed to add shared torrent '{targetId.ToHex()}' to the engine.", ex);
+            }
+ 
+            if (manager == null)
+            {
+                System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Engine.AddAsync returned null for {targetId.ToHex()}."); // Use Debug.WriteLine
+                throw new TorrentException($"Failed to obtain TorrentManager for shared torrent '{targetId.ToHex()}'.");
+            }
+
+            _managedTorrents.Add(targetId, manager);
+            _publicKeys[targetId] = publicKey;
+            _mutableSequenceNumbers[targetId] = currentSequenceNumber;
+            _lastKnownVDictionary[targetId] = vDictionary;
+            if (currentSignature != null)
+            {
+                _lastKnownSignature[targetId] = currentSignature;
+            } else {
+                 System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Warning: Signature was null when storing state for {targetId.ToHex()}."); // Use Debug.WriteLine
+                 _lastKnownSignature[targetId] = new byte[64]; // Placeholder
+            }
+ 
+            // *** Re-enable DHT for the manager now that we have the initial state ***
+            // This allows it to participate in finding updates for the mutable torrent.
+            var settingsBuilder949 = new TorrentSettingsBuilder(manager.Settings);
+            settingsBuilder949.AllowDht = true;
+            await manager.UpdateSettingsAsync(settingsBuilder949.ToSettings());
+            System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Enabled DHT for manager {targetId.ToHex()}."); // Use Debug.WriteLine
+ 
+            string managerInfoHashHex = manager?.InfoHashes?.V1OrV2?.ToHex() ?? "N/A";
+            System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Subscribing TorrentManager ({managerInfoHashHex}) TorrentUpdateAvailable event for {targetId.ToHex()}."); // Use Debug.WriteLine
+            manager.TorrentUpdateAvailable += OnTorrentUpdateAvailable;
+            // The manager should now be able to start and participate in DHT correctly.
+            System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Manager added and configured for {targetId.ToHex()}. It will start automatically after metadata retrieval if needed."); // Use Debug.WriteLine
+            await manager.StartAsync(); // Explicitly start the manager to trigger engine start
+            System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Manager explicitly started for {targetId.ToHex()}. Current State: {manager.State}");
+
+            System.Diagnostics.Debug.WriteLine($"[JoinOrCreateMutable] Completed for {targetId.ToHex()}."); // Use Debug.WriteLine
+            return targetId;
+        }
+
+
+        // --- Private Helper Methods ---
+
+        private byte[] GeneratePrivateKeySeed()
+        {
+            var secureRandom = new BCrypt::Org.BouncyCastle.Security.SecureRandom();
+            var keyPairGenerator = BCrypt::Org.BouncyCastle.Security.GeneratorUtilities.GetKeyPairGenerator("Ed25519");
+            keyPairGenerator.Init(new BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519KeyGenerationParameters(secureRandom));
+            var keyPair = keyPairGenerator.GenerateKeyPair();
+            var privateKeyParams = (BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519PrivateKeyParameters)keyPair.Private;
+            return privateKeyParams.GetEncoded().AsSpan(0, 32).ToArray();
+        }
+
+        private byte[] GetPublicKeyFromSeed(byte[] seed)
+        {
+            if (seed == null || seed.Length != 32)
+                throw new ArgumentException("Seed must be 32 bytes.", nameof(seed));
+
+            var privateKeyParams = new BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519PrivateKeyParameters(seed, 0);
+            var publicKeyParams = privateKeyParams.GeneratePublicKey();
+            return publicKeyParams.GetEncoded();
+        }
+
+        private InfoHash CalculateInfoHash(byte[] publicKey)
+        {
+            using (var sha1 = SHA1.Create())
+            {
+                return new InfoHash(sha1.ComputeHash(publicKey));
+            }
+        }
+
+        private byte[] SignData(byte[] dataToSign, byte[] signingKeySeed)
+        {
+            if (signingKeySeed == null || signingKeySeed.Length != 32)
+                throw new ArgumentException("Signing key seed must be 32 bytes.", nameof(signingKeySeed));
+
+            var signer = new BCrypt::Org.BouncyCastle.Crypto.Signers.Ed25519Signer();
+            var signingPrivateKeyParams = new BCrypt::Org.BouncyCastle.Crypto.Parameters.Ed25519PrivateKeyParameters(signingKeySeed, 0);
+            signer.Init(true, signingPrivateKeyParams);
+            signer.BlockUpdate(dataToSign, 0, dataToSign.Length);
+            return signer.GenerateSignature();
+        }
+
+        private byte[] ConstructDataToSign(long sequenceNumber, BEncodedDictionary vDictionary, BEncodedString? salt = null)
+        {
+            var seqKey = new BEncodedString("seq");
+            var seqValue = new BEncodedNumber(sequenceNumber);
+            var vKey = new BEncodedString("v");
+            var encodedVDictionary = vDictionary.Encode();
+
+            int totalLength;
+            BEncodedString? saltKey = null;
+
+            if (salt != null)
+            {
+                saltKey = new BEncodedString("salt");
+                totalLength = saltKey.LengthInBytes() + salt.LengthInBytes() + seqKey.LengthInBytes() + seqValue.LengthInBytes() + vKey.LengthInBytes() + encodedVDictionary.Length;
+            }
+            else
+            {
+                totalLength = seqKey.LengthInBytes() + seqValue.LengthInBytes() + vKey.LengthInBytes() + encodedVDictionary.Length;
+            }
+
+            var dataToSign = new byte[totalLength];
+            int offset = 0;
+
+            if (saltKey != null && salt != null)
+            {
+                offset += saltKey.Encode(dataToSign.AsSpan(offset));
+                offset += salt.Encode(dataToSign.AsSpan(offset));
+            }
+
+            offset += seqKey.Encode(dataToSign.AsSpan(offset));
+            offset += seqValue.Encode(dataToSign.AsSpan(offset));
+            offset += vKey.Encode(dataToSign.AsSpan(offset));
+            offset += vDictionary.Encode(dataToSign.AsSpan(offset));
+
+            return dataToSign;
+        }
 
         /// <summary>
         /// Stops the MonoTorrent ClientEngine and releases resources.
         /// </summary>
-        public async ValueTask DisposeAsync()
+        public async ValueTask DisposeAsync() // Correctly implements IAsyncDisposable
         {
-            // Use _engine! now that we've checked for null
             if (_engine != null)
             {
-                // Unsubscribe from events for all managed torrents
                 foreach(var kvp in _managedTorrents)
                 {
-                    // Check if it was a mutable torrent we subscribed to
                     if (_publicKeys.ContainsKey(kvp.Key)) {
-                         // Compiler Error CS0122 likely due to project reference issue. OnTorrentUpdateAvailable signature depends on TorrentUpdateEventArgs.
-                         // No need to check _publicKeys here, just try to unsubscribe.
-                         // If it wasn't subscribed, this does nothing.
                          kvp.Value.TorrentUpdateAvailable -= OnTorrentUpdateAvailable;
                     }
                 }
-                await _engine.StopAllAsync(); // Stop torrents before disposing engine
+                // Save DHT nodes before stopping
+                if (_engine.Dht is IDhtEngine dhtEngine && !string.IsNullOrEmpty(_dhtNodesFilePath))
+                {
+                    try
+                    {
+                        ReadOnlyMemory<byte> nodesToSave = await dhtEngine.SaveNodesAsync();
+                        if (!nodesToSave.IsEmpty)
+                        {
+                            Directory.CreateDirectory(Path.GetDirectoryName(_dhtNodesFilePath)!);
+                            await File.WriteAllBytesAsync(_dhtNodesFilePath, nodesToSave.ToArray());
+                            System.Diagnostics.Debug.WriteLine($"[TorrentService] Saved {nodesToSave.Length} bytes of DHT nodes to {_dhtNodesFilePath}"); // Use Debug.WriteLine
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                         System.Diagnostics.Debug.WriteLine($"[TorrentService] Warning: Failed to save DHT nodes to {_dhtNodesFilePath}: {ex.Message}"); // Use Debug.WriteLine
+                    }
+                }
+
+                await _engine.StopAllAsync();
                 _engine.Dispose();
                 _engine = null;
             }
@@ -833,8 +1091,6 @@ namespace TorrentWrapper
 
         private static int CalculatePieceLength(long totalSize)
         {
-            // Simple logic: Aim for roughly 1500 pieces.
-            // Adjust thresholds and logic as needed.
             const int minPieceLength = 16 * 1024; // 16 KiB
             const int maxPieceLength = 4 * 1024 * 1024; // 4 MiB
             const int targetPieces = 1500;
@@ -843,16 +1099,13 @@ namespace TorrentWrapper
 
             long idealPieceLength = totalSize / targetPieces;
 
-            // Ensure it's a power of 2
             int powerOf2Length = minPieceLength;
             while (powerOf2Length < idealPieceLength && powerOf2Length < maxPieceLength)
             {
                 powerOf2Length *= 2;
             }
-
-            // Clamp to min/max
             return Math.Clamp(powerOf2Length, minPieceLength, maxPieceLength);
         }
-    } // End of TorrentService class
 
+    } // End of TorrentService class
 } // End of namespace
