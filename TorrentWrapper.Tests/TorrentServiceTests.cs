@@ -13,6 +13,7 @@ using System;
 using System.Security.Cryptography; // For SHA256
 using System.Text; // For Encoding
 using MonoTorrent.BEncoding; // For BEncodedDictionary etc.
+using MonoTorrent.Trackers; // For AnnounceMode
 
 namespace TorrentWrapper.Tests
 {
@@ -50,21 +51,22 @@ namespace TorrentWrapper.Tests
             _listenPort2 = Interlocked.Increment(ref _portCounter);
 
             // Configure settings for two separate engine instances
-             _settings1 = new EngineSettingsBuilder {
-                AllowPortForwarding = false, // Disable for local tests
-                AutoSaveLoadFastResume = false, // Disable for predictable test state
+            _settings1 = new EngineSettingsBuilder
+            {
+                AllowPortForwarding = true,
+                AutoSaveLoadFastResume = false,
                 CacheDirectory = Path.Combine(_baseDirectory1, "cache"),
-                DhtEndPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, _dhtPort1),
-                ListenEndPoints = new Dictionary<string, System.Net.IPEndPoint> { { "", new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, _listenPort1) } }
+                DhtEndPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("82.30.95.76"), _dhtPort1),
+                ListenEndPoints = new Dictionary<string, System.Net.IPEndPoint> { { "", new System.Net.IPEndPoint(System.Net.IPAddress.Parse("82.30.95.76"), _listenPort1) } }
             }.ToSettings();
 
-             _settings2 = new EngineSettingsBuilder {
-                AllowPortForwarding = false,
+            _settings2 = new EngineSettingsBuilder
+            {
+                AllowPortForwarding = true,
                 AutoSaveLoadFastResume = false,
                 CacheDirectory = Path.Combine(_baseDirectory2, "cache"),
-                DhtEndPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, _dhtPort2),
-                ListenEndPoints = new Dictionary<string, System.Net.IPEndPoint> { { "", new System.Net.IPEndPoint(System.Net.IPAddress.Loopback, _listenPort2) } },
-                // Both services will now use the default public bootstrap nodes
+                DhtEndPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("82.30.95.76"), _dhtPort2),
+                ListenEndPoints = new Dictionary<string, System.Net.IPEndPoint> { { "", new System.Net.IPEndPoint(System.Net.IPAddress.Parse("82.30.95.76"), _listenPort2) } }
             }.ToSettings();
 
 
@@ -85,7 +87,7 @@ namespace TorrentWrapper.Tests
         {
             if (_service1 != null)
                 await _service1.DisposeAsync();
-             if (_service2 != null)
+            if (_service2 != null)
                 await _service2.DisposeAsync();
 
             // Clean up temporary directories
@@ -211,16 +213,20 @@ namespace TorrentWrapper.Tests
             // Setup event listener on Service 2
             MutableTorrentUpdateInfoEventArgs? receivedArgs = null;
             var updateReceivedSignal = new TaskCompletionSource<bool>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) => { // args is now MutableTorrentUpdateInfoEventArgs
+            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
+            { // args is now MutableTorrentUpdateInfoEventArgs
                 Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Received MutableTorrentUpdateAvailable. Original: {args.OriginalInfoHash.ToHex()}, New: {args.NewInfoHash.ToHex()}, Expected Original: {loadedIdentifier.ToHex()}");
                 // Check if the update is for the torrent we loaded by comparing the original InfoHash
-                 if (args.OriginalInfoHash == loadedIdentifier) {
+                if (args.OriginalInfoHash == loadedIdentifier)
+                {
                     Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Match found! Setting signal.");
                     receivedArgs = args; // Assign the correct type
                     updateReceivedSignal.TrySetResult(true);
-                 } else {
-                     Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Mismatch: OriginalInfoHash {args.OriginalInfoHash.ToHex()} != Expected {loadedIdentifier.ToHex()}");
-                 }
+                }
+                else
+                {
+                    Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Mismatch: OriginalInfoHash {args.OriginalInfoHash.ToHex()} != Expected {loadedIdentifier.ToHex()}");
+                }
             };
 
             // Service 1 adds a file
@@ -233,11 +239,11 @@ namespace TorrentWrapper.Tests
             await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier); // Use the new method
             Console.WriteLine($"[Test {_service2.GetHashCode()}] Update check triggered. Waiting for update signal...");
 
-             // Wait for Service 2 to receive the update via DHT/event
-             Console.WriteLine($"[Test {_service2.GetHashCode()}] Waiting for update signal...");
-             bool updateReceived = await Task.WhenAny(updateReceivedSignal.Task, Task.Delay(20000)) == updateReceivedSignal.Task; // Increased timeout to 20 sec
+            // Wait for Service 2 to receive the update via DHT/event
+            Console.WriteLine($"[Test {_service2.GetHashCode()}] Waiting for update signal...");
+            bool updateReceived = await Task.WhenAny(updateReceivedSignal.Task, Task.Delay(20000)) == updateReceivedSignal.Task; // Increased timeout to 20 sec
 
-             Assert.IsTrue(updateReceived, "Service 2 did not receive the torrent update event within the timeout.");
+            Assert.IsTrue(updateReceived, "Service 2 did not receive the torrent update event within the timeout.");
             Assert.IsNotNull(receivedArgs, "Received event args should not be null.");
             // receivedArgs is now MutableTorrentUpdateInfoEventArgs
             Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null.");
@@ -251,7 +257,7 @@ namespace TorrentWrapper.Tests
             // Assert.IsTrue(files.Any(f => f.EndsWith("added_file.dat")));
         }
 
-         [TestMethod]
+        [TestMethod]
         public async Task RemoveFile_ShouldPropagateUpdate()
         {
             Assert.IsNotNull(_service1);
@@ -264,12 +270,12 @@ namespace TorrentWrapper.Tests
             string initialFile2 = CreateDummyFile(_baseDirectory1, "file2.txt", 20);
             // Need TorrentCreator to add multiple files initially, or add one then modify
             // Let's modify after creation for simplicity here
-             var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile1);
-             long seqAfterAdd = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, initialFile2, privateKeySeed);
-             Assert.AreEqual(1, seqAfterAdd, "Sequence number after adding second file should be 1.");
-             // Need to get the *new* identifier after the add
-             // This highlights a potential API improvement: modification methods could return the new identifier/state.
-             // For now, we'll assume the identifier remains the public key hash, but the *state* is updated.
+            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile1);
+            long seqAfterAdd = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, initialFile2, privateKeySeed);
+            Assert.AreEqual(1, seqAfterAdd, "Sequence number after adding second file should be 1.");
+            // Need to get the *new* identifier after the add
+            // This highlights a potential API improvement: modification methods could return the new identifier/state.
+            // For now, we'll assume the identifier remains the public key hash, but the *state* is updated.
 
             // Service 2 loads
             string downloadPath2 = Path.Combine(_baseDirectory2, "downloads_remove");
@@ -282,22 +288,26 @@ namespace TorrentWrapper.Tests
             // Setup event listener on Service 2
             MutableTorrentUpdateInfoEventArgs? receivedArgs = null;
             var updateReceivedSignal = new TaskCompletionSource<bool>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) => { // args is now MutableTorrentUpdateInfoEventArgs
-                 Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Received MutableTorrentUpdateAvailable. Original: {args.OriginalInfoHash.ToHex()}, New: {args.NewInfoHash.ToHex()}, Expected Original: {loadedIdentifier.ToHex()}");
-                 // Check if the update is for the torrent we loaded by comparing the original InfoHash
-                 if (args.OriginalInfoHash == loadedIdentifier) {
-                     // Signal completion on the first relevant update received after triggering the check.
-                     // The update check should fetch the latest state (Seq 2).
-                     Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Matching update received! Setting signal.");
-                     receivedArgs = args; // Assign the correct type
-                     updateReceivedSignal.TrySetResult(true);
-                 } else {
-                     Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Mismatch: OriginalInfoHash {args.OriginalInfoHash.ToHex()} != Expected {loadedIdentifier.ToHex()}");
-                 }
+            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
+            { // args is now MutableTorrentUpdateInfoEventArgs
+                Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Received MutableTorrentUpdateAvailable. Original: {args.OriginalInfoHash.ToHex()}, New: {args.NewInfoHash.ToHex()}, Expected Original: {loadedIdentifier.ToHex()}");
+                // Check if the update is for the torrent we loaded by comparing the original InfoHash
+                if (args.OriginalInfoHash == loadedIdentifier)
+                {
+                    // Signal completion on the first relevant update received after triggering the check.
+                    // The update check should fetch the latest state (Seq 2).
+                    Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Matching update received! Setting signal.");
+                    receivedArgs = args; // Assign the correct type
+                    updateReceivedSignal.TrySetResult(true);
+                }
+                else
+                {
+                    Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Mismatch: OriginalInfoHash {args.OriginalInfoHash.ToHex()} != Expected {loadedIdentifier.ToHex()}");
+                }
             };
 
-             // Wait for the *first* update (from the AddFile) to likely propagate before removing
-             await Task.Delay(5000); // Give DHT time
+            // Wait for the *first* update (from the AddFile) to likely propagate before removing
+            await Task.Delay(5000); // Give DHT time
 
             // Service 1 removes the second file
             long seqAfterRemove = await _service1.RemoveFileFromMutableTorrentAsync(initialIdentifier, "file2.txt", privateKeySeed);
@@ -382,8 +392,10 @@ namespace TorrentWrapper.Tests
 
             // Setup event listener on Service 2
             var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
-                if (args.OriginalInfoHash == loadedIdentifier) {
+            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
+            {
+                if (args.OriginalInfoHash == loadedIdentifier)
+                {
                     updateReceivedSignal.TrySetResult(args);
                 }
             };
@@ -433,8 +445,10 @@ namespace TorrentWrapper.Tests
 
             // Setup event listener on Service 2
             var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
-                if (args.OriginalInfoHash == loadedIdentifier) {
+            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
+            {
+                if (args.OriginalInfoHash == loadedIdentifier)
+                {
                     updateReceivedSignal.TrySetResult(args);
                 }
             };
@@ -460,7 +474,7 @@ namespace TorrentWrapper.Tests
         // Helper to connect DHTs
         private async Task ConnectDhtsAsync()
         {
-             if (_service1?.DhtAccess != null && _service2?.DhtAccess != null && _settings1?.DhtEndPoint != null && _settings2?.DhtEndPoint != null)
+            if (_service1?.DhtAccess != null && _service2?.DhtAccess != null && _settings1?.DhtEndPoint != null && _settings2?.DhtEndPoint != null)
             {
                 var dummyId1 = MonoTorrent.Dht.NodeId.Create();
                 var dummyId2 = MonoTorrent.Dht.NodeId.Create();
@@ -524,8 +538,10 @@ namespace TorrentWrapper.Tests
 
             // Setup event listener on Service 2
             var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
-                if (args.OriginalInfoHash == loadedIdentifier) {
+            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
+            {
+                if (args.OriginalInfoHash == loadedIdentifier)
+                {
                     updateReceivedSignal.TrySetResult(args);
                 }
             };
@@ -578,8 +594,10 @@ namespace TorrentWrapper.Tests
 
             // Setup event listener on Service 2 - Expect one update corresponding to the final state
             var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
-                if (args.OriginalInfoHash == loadedIdentifier) {
+            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
+            {
+                if (args.OriginalInfoHash == loadedIdentifier)
+                {
                     Console.WriteLine($"[Test Handler UpdateNested] Received final update event.");
                     updateReceivedSignal.TrySetResult(args); // Signal completion on the first (and only expected) update
                 }
@@ -650,8 +668,10 @@ namespace TorrentWrapper.Tests
                             signature: result.signature
                         );
                         Console.WriteLine("[AutoBootstrapTest] Explicitly stored initial mutable item (seq 0) in Service2's DHT.");
-                    } else {
-                         Console.WriteLine("[AutoBootstrapTest] Warning: Could not fetch initial mutable item (seq 0) from Service1 for replication.");
+                    }
+                    else
+                    {
+                        Console.WriteLine("[AutoBootstrapTest] Warning: Could not fetch initial mutable item (seq 0) from Service1 for replication.");
                     }
                 }
                 catch (Exception ex)
@@ -672,7 +692,8 @@ namespace TorrentWrapper.Tests
 
             // Setup event listener on Service 2
             var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) => {
+            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
+            {
                 if (args.OriginalInfoHash == loadedIdentifier)
                 {
                     Console.WriteLine($"[AutoBootstrapTest] Update event received: {args.NewInfoHash.ToHex()}");
@@ -727,9 +748,10 @@ namespace TorrentWrapper.Tests
                         }
                         await Task.Delay(500); // Check every 500ms
                     }
-                     if (!replicated) {
-                         Console.WriteLine("[AutoBootstrapTest] Warning: Timed out waiting for updated mutable item in Service1 DHT during replication. Test might fail.");
-                     }
+                    if (!replicated)
+                    {
+                        Console.WriteLine("[AutoBootstrapTest] Warning: Timed out waiting for updated mutable item in Service1 DHT during replication. Test might fail.");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -750,6 +772,43 @@ namespace TorrentWrapper.Tests
             Assert.IsNotNull(receivedArgs.NewInfoHash);
             Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash);
             Console.WriteLine("[AutoBootstrapTest] Success: update propagated via DHT bootstrap.");
+        }
+
+        // --- Helper Methods for Chat Tests ---
+
+        private BEncodedDictionary CreateChatMessage(string user, string message)
+        {
+            return new BEncodedDictionary {
+                { "id", (BEncodedString)Guid.NewGuid().ToString() },
+                { "ts", (BEncodedString)DateTime.UtcNow.ToString("o") },
+                { "u", (BEncodedString)user },
+                { "m", (BEncodedString)message }
+            };
+        }
+
+        private BEncodedList GetMessagesFromVDict(BEncodedDictionary vDict)
+        {
+            if (vDict.TryGetValue("messages", out var messagesValue) && messagesValue is BEncodedList messageList)
+            {
+                return messageList;
+            }
+            return new BEncodedList(); // Return empty list if not found
+        }
+
+        private bool VerifyMessageExists(BEncodedList messageList, string expectedUser, string expectedMessage)
+        {
+            foreach (var item in messageList.OfType<BEncodedDictionary>())
+            {
+                if (item.TryGetValue("u", out var userValue) && userValue is BEncodedString userStr &&
+                    item.TryGetValue("m", out var msgValue) && msgValue is BEncodedString msgStr)
+                {
+                    if (userStr.Text == expectedUser && msgStr.Text == expectedMessage)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         // --- NEW TESTS for JoinOrCreateMutableTorrentAsync ---
@@ -819,15 +878,15 @@ namespace TorrentWrapper.Tests
             var vDict2 = _service2.GetLastKnownVDictionaryForTest(handle2)!;
             Assert.AreEqual(lobbyName, ((MonoTorrent.BEncoding.BEncodedString)vDict2["name"]).Text, "Service 2 torrent name mismatch.");
             Assert.AreEqual(0, ((MonoTorrent.BEncoding.BEncodedList)vDict2["files"]).Count, "Service 2 file list should be empty.");
-             Assert.IsNotNull(_service2.GetLastKnownSignatureForTest(handle2), "Service 2 should cache signature.");
-             Assert.AreEqual(64, _service2.GetLastKnownSignatureForTest(handle2)!.Length, "Service 2 signature should be 64 bytes.");
+            Assert.IsNotNull(_service2.GetLastKnownSignatureForTest(handle2), "Service 2 should cache signature.");
+            Assert.AreEqual(64, _service2.GetLastKnownSignatureForTest(handle2)!.Length, "Service 2 signature should be 64 bytes.");
 
             // Verify torrent is managed by both
             // Assert.IsTrue(_service1.IsManaging(handle1));
             // Assert.IsTrue(_service2.IsManaging(handle2));
         }
 
-         [TestMethod]
+        [TestMethod]
         public async Task JoinOrCreate_JoinsExisting_AfterUpdate()
         {
             Assert.IsNotNull(_service1);
@@ -862,39 +921,225 @@ namespace TorrentWrapper.Tests
                 _service2.StoreItemLocallyForTest(pubKeyBytes, null, vDict, newSeq, sig.AsMemory().ToArray());
                 Console.WriteLine($"[JoinAfterUpdate] Explicitly replicated updated state (seq {newSeq}) to Service 2 DHT via StoreItemLocallyForTest helper.");
             }
-             else
+            else
             {
                 Assert.Inconclusive("Cannot replicate state for test as DHT access is null.");
+                // Removed GetPublicKeyForTorrentHelper as GetPublicKeyForTorrent is now public in TorrentService
+
+
+                // Service 2 joins the lobby AFTER the update
+                InfoHash handle2 = await _service2.JoinOrCreateMutableTorrentAsync(lobbyName, lobbySeed, savePath2);
+
+                // Assert
+                Assert.AreEqual(handle1, handle2, "Both services should converge on the same handle.");
+                Assert.IsTrue(_service2.MutableSequenceNumbers.ContainsKey(handle2), "Service 2 should track sequence number.");
+                // Service 2 should have fetched the latest state (seq 1)
+                Assert.AreEqual(1, _service2.MutableSequenceNumbers[handle2], "Service 2 sequence number should be 1 after joining updated lobby.");
+                Assert.IsNotNull(_service2.GetLastKnownVDictionaryForTest(handle2), "Service 2 should cache vDictionary.");
+                var vDict2 = _service2.GetLastKnownVDictionaryForTest(handle2)!;
+                Assert.AreEqual(lobbyName, ((MonoTorrent.BEncoding.BEncodedString)vDict2["name"]).Text, "Service 2 torrent name mismatch.");
+                Assert.AreEqual(1, ((MonoTorrent.BEncoding.BEncodedList)vDict2["files"]).Count, "Service 2 file list should contain 1 file.");
+                // Further check file details if needed
+                var files = ((MonoTorrent.BEncoding.BEncodedList)vDict2["files"]);
+                Assert.AreEqual(1, files.Count, "File list should contain one entry after join.");
+                var fileEntry = files[0] as MonoTorrent.BEncoding.BEncodedDictionary;
+                Assert.IsNotNull(fileEntry, "File entry should be a dictionary.");
+                var pathList = fileEntry["path"] as MonoTorrent.BEncoding.BEncodedList;
+                Assert.IsNotNull(pathList, "Path entry should be a list.");
+                Assert.AreEqual("lobby_file.txt", ((MonoTorrent.BEncoding.BEncodedString)pathList[0]).Text);
+            }
+
             // Removed GetPublicKeyForTorrentHelper as GetPublicKeyForTorrent is now public in TorrentService
-
-
-            // Service 2 joins the lobby AFTER the update
-            InfoHash handle2 = await _service2.JoinOrCreateMutableTorrentAsync(lobbyName, lobbySeed, savePath2);
-
-            // Assert
-            Assert.AreEqual(handle1, handle2, "Both services should converge on the same handle.");
-            Assert.IsTrue(_service2.MutableSequenceNumbers.ContainsKey(handle2), "Service 2 should track sequence number.");
-            // Service 2 should have fetched the latest state (seq 1)
-            Assert.AreEqual(1, _service2.MutableSequenceNumbers[handle2], "Service 2 sequence number should be 1 after joining updated lobby.");
-            Assert.IsNotNull(_service2.GetLastKnownVDictionaryForTest(handle2), "Service 2 should cache vDictionary.");
-            var vDict2 = _service2.GetLastKnownVDictionaryForTest(handle2)!;
-            Assert.AreEqual(lobbyName, ((MonoTorrent.BEncoding.BEncodedString)vDict2["name"]).Text, "Service 2 torrent name mismatch.");
-            Assert.AreEqual(1, ((MonoTorrent.BEncoding.BEncodedList)vDict2["files"]).Count, "Service 2 file list should contain 1 file.");
-            // Further check file details if needed
-            var files = ((MonoTorrent.BEncoding.BEncodedList)vDict2["files"]);
-            Assert.AreEqual(1, files.Count, "File list should contain one entry after join.");
-            var fileEntry = files[0] as MonoTorrent.BEncoding.BEncodedDictionary;
-            Assert.IsNotNull(fileEntry, "File entry should be a dictionary.");
-            var pathList = fileEntry["path"] as MonoTorrent.BEncoding.BEncodedList;
-            Assert.IsNotNull(pathList, "Path entry should be a list.");
-            Assert.AreEqual("lobby_file.txt", ((MonoTorrent.BEncoding.BEncodedString)pathList[0]).Text);
-        }
-
-        // Removed GetPublicKeyForTorrentHelper as GetPublicKeyForTorrent is now public in TorrentService
         }
 
 
         // --- Test Methods End ---
 
+        [TestMethod]
+        public async Task Chat_TwoInstances_ShouldExchangeMessages()
+        {
+            byte[] chatSeed = Array.Empty<byte>();
+            InfoHash handle1 = default;
+            InfoHash handle2 = default;
+            Assert.IsNotNull(_service1);
+            Assert.IsNotNull(_service2);
+            Assert.IsNotNull(_baseDirectory1);
+            Assert.IsNotNull(_baseDirectory2);
+
+            // Wait for both DHT engines to bootstrap to the public DHT network
+            // Exchange DHT endpoints and add as bootstrap nodes to simulate realistic peer discovery
+            if (_service1?.DhtAccess != null && _service2?.DhtAccess != null && _settings1?.DhtEndPoint != null && _settings2?.DhtEndPoint != null)
+            {
+                var nodeId1 = MonoTorrent.Dht.NodeId.Create();
+                var nodeId2 = MonoTorrent.Dht.NodeId.Create();
+
+            // Wait a bit to allow DHT pings to complete and routing tables to populate
+            // Add public tracker URL to magnet links or torrent metadata
+            string trackerUrl = "udp://tracker.opentrackr.org:1337/announce";
+
+            // Both services join/create the chat torrent with tracker URL
+            chatSeed = GenerateSeedFromString("test-chat-exchange");
+            var publicKey = _service1!.GetPublicKeyFromSeed(chatSeed);
+            var publicKeyHex = Convert.ToHexString(publicKey).ToLowerInvariant();
+            string chatName = "TestChatExchange";
+            string savePath1 = Path.Combine(_baseDirectory1, "chat_exchange1");
+            string savePath2 = Path.Combine(_baseDirectory2, "chat_exchange2");
+
+            var magnetUri1 = $"magnet:?xs=urn:btpk:{publicKeyHex}&tr={Uri.EscapeDataString(trackerUrl)}&dn={Uri.EscapeDataString(chatName)}";
+            var magnetUri2 = magnetUri1; // Same magnet link
+
+            var magnetLink1 = MonoTorrent.MagnetLink.Parse(magnetUri1);
+            var magnetLink2 = MonoTorrent.MagnetLink.Parse(magnetUri2);
+
+            handle1 = await _service1.LoadTorrentAsync(magnetLink1, savePath1);
+            handle2 = await _service2.LoadTorrentAsync(magnetLink2, savePath2);
+
+            // Force announce to tracker to discover each other's IPs
+            Console.WriteLine("[Test] Forcing announce to tracker...");
+            var manager1 = _service1.TryGetManager(handle1, out var m1) ? m1 : null;
+            var manager2 = _service2.TryGetManager(handle2, out var m2) ? m2 : null;
+
+            if (manager1 != null)
+                await manager1.TrackerManager.AnnounceAsync(System.Threading.CancellationToken.None);
+            if (manager2 != null)
+                await manager2.TrackerManager.AnnounceAsync(System.Threading.CancellationToken.None);
+
+            // Wait a bit for tracker responses
+            await Task.Delay(5000);
+
+            // Extract peer lists
+            var peerIds1 = manager1 != null ? await manager1.GetPeersAsync() : new List<MonoTorrent.Client.PeerId>();
+            var peerIds2 = manager2 != null ? await manager2.GetPeersAsync() : new List<MonoTorrent.Client.PeerId>();
+
+            var peers1 = peerIds1.Select(p => p.Uri).ToList();
+            var peers2 = peerIds2.Select(p => p.Uri).ToList();
+
+            Console.WriteLine($"[Test] Service1 sees peers: {string.Join(", ", peers1)}");
+            Console.WriteLine($"[Test] Service2 sees peers: {string.Join(", ", peers2)}");
+
+            // Add each other's IP:port as DHT bootstrap nodes
+            foreach (var uri in peers1 ?? Enumerable.Empty<Uri>())
+            {
+                var ip = System.Net.IPAddress.Parse(uri.Host);
+                var port = uri.Port;
+                var nodeId = MonoTorrent.Dht.NodeId.Create();
+                var buffer = new byte[26];
+                nodeId.Span.CopyTo(buffer.AsSpan(0, 20));
+                ip.GetAddressBytes().CopyTo(buffer.AsSpan(20, 4));
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(24, 2), (ushort)port);
+                _service2.DhtAccess?.Add(new[] { new ReadOnlyMemory<byte>(buffer) });
+            }
+
+            foreach (var uri in peers2 ?? Enumerable.Empty<Uri>())
+            {
+                var ip = System.Net.IPAddress.Parse(uri.Host);
+                var port = uri.Port;
+                var nodeId = MonoTorrent.Dht.NodeId.Create();
+                var buffer = new byte[26];
+                nodeId.Span.CopyTo(buffer.AsSpan(0, 20));
+                ip.GetAddressBytes().CopyTo(buffer.AsSpan(20, 4));
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(24, 2), (ushort)port);
+                _service1.DhtAccess?.Add(new[] { new ReadOnlyMemory<byte>(buffer) });
+            }
+
+            Console.WriteLine("[Test] Added discovered peers as DHT bootstrap nodes.");
+
+            await Task.Delay(3000);
+            await Task.Delay(3000);
+                var buffer1 = new byte[26];
+                nodeId1.Span.CopyTo(buffer1.AsSpan(0, 20));
+                _settings1.DhtEndPoint.Address.GetAddressBytes().CopyTo(buffer1.AsSpan(20, 4));
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buffer1.AsSpan(24, 2), (ushort)_settings1.DhtEndPoint.Port);
+
+                var buffer2 = new byte[26];
+                nodeId2.Span.CopyTo(buffer2.AsSpan(0, 20));
+                _settings2.DhtEndPoint.Address.GetAddressBytes().CopyTo(buffer2.AsSpan(20, 4));
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buffer2.AsSpan(24, 2), (ushort)_settings2.DhtEndPoint.Port);
+
+                _service1.DhtAccess.Add(new[] { new ReadOnlyMemory<byte>(buffer2) });
+                _service2.DhtAccess.Add(new[] { new ReadOnlyMemory<byte>(buffer1) });
+
+                Console.WriteLine("[Test] Exchanged DHT endpoints and added as bootstrap nodes.");
+            }
+
+            await WaitForBothDhtsReadyAsync();
+        }
+        [TestMethod]
+        public async Task DhtEngine_ShouldReachReadyState()
+        {
+            var dhtEngine = new MonoTorrent.Dht.DhtEngine();
+
+            var bootstrapRouters = new[] { "router.bittorrent.com", "router.utorrent.com", "dht.transmissionbt.com" };
+
+            Console.WriteLine("[DHT Test] Starting DhtEngine with bootstrap routers...");
+            await dhtEngine.StartAsync(bootstrapRouters);
+
+            var timeout = TimeSpan.FromSeconds(30);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.Elapsed < timeout)
+            {
+                if (dhtEngine.State == MonoTorrent.Dht.DhtState.Ready)
+                {
+                    Console.WriteLine("[DHT Test] DhtEngine reached Ready state.");
+                    break;
+                }
+                Console.WriteLine($"[DHT Test] Waiting... Current state: {dhtEngine.State}");
+                await Task.Delay(1000);
+            }
+
+            Console.WriteLine($"[DHT Test] Final state after {sw.Elapsed.TotalSeconds:F1}s: {dhtEngine.State}");
+            Assert.AreEqual(MonoTorrent.Dht.DhtState.Ready, dhtEngine.State, "DhtEngine should reach Ready state");
+        }
+        [TestMethod]
+        public async Task PublicTracker_ShouldReturnPeers()
+        {
+            var service = new TorrentService();
+            await service.InitializeAsync();
+
+            string trackerUrl = "udp://tracker.opentrackr.org:1337/announce";
+            string ubuntuMagnet = "magnet:?xt=urn:btih:UQ2Q2CLSJNVPWWXLKECFMCNU7S4ODTWT&dn=0ad-0.27.0-win32.exe&xl=1448260473&tr=http%3A%2F%2Freleases.wildfiregames.com%3A2710%2Fannounce";
+
+            var magnetLink = MonoTorrent.MagnetLink.Parse(ubuntuMagnet);
+            var savePath = Path.Combine(Path.GetTempPath(), "public_tracker_test_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(savePath);
+
+            var handle = await service.LoadTorrentAsync(magnetLink, savePath);
+            var manager = service.TryGetManager(handle, out var m) ? m : null;
+            Assert.IsNotNull(manager, "TorrentManager should not be null");
+
+            Console.WriteLine("[Test] Forcing announce to public tracker...");
+            await manager.TrackerManager.AnnounceAsync(System.Threading.CancellationToken.None);
+
+            Console.WriteLine("[Test] Waiting 10 seconds for tracker response...");
+            await Task.Delay(10000);
+
+            var peers = await manager.GetPeersAsync();
+            Console.WriteLine($"[Test] Found {peers.Count} peers from public tracker:");
+            foreach (var peer in peers)
+            {
+                Console.WriteLine($"Peer: {peer.Uri}");
+            }
+
+            Assert.IsTrue(peers.Count > 0, "Should find at least one peer from public tracker");
+        }
+
+        private async Task WaitForBothDhtsReadyAsync()
+        {
+            var timeout = TimeSpan.FromSeconds(30);
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            while (sw.Elapsed < timeout)
+            {
+                var ready1 = _service1?.DhtAccess?.State == MonoTorrent.Dht.DhtState.Ready;
+                var ready2 = _service2?.DhtAccess?.State == MonoTorrent.Dht.DhtState.Ready;
+                if (ready1 && ready2)
+                {
+                    Console.WriteLine("[Test] Both DHT engines reached Ready state.");
+                    return;
+                }
+                await Task.Delay(500);
+            }
+            Assert.Fail("DHT engines did not reach Ready state within timeout.");
+        }
     }
+
 }
