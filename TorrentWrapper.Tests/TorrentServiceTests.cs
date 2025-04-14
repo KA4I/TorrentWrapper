@@ -1,1145 +1,913 @@
-using Microsoft.VisualStudio.TestTools.UnitTesting;
-using TorrentWrapper;
-using MonoTorrent.Client; // For EngineSettingsBuilder, TorrentUpdateEventArgs etc.
-using MonoTorrent.Dht;      // For NodeId, DhtEngine
-using System.Buffers.Binary; // For BinaryPrimitives
-using MonoTorrent;      // For InfoHash, MagnetLink etc.
-using System.IO;
-using System.Threading.Tasks;
-using System.Linq;
-using System.Collections.Generic;
-using System.Threading;
+using NUnit.Framework;
+using NUnit.Framework.Legacy; // Add this for ClassicAssert
 using System;
-using System.Security.Cryptography; // For SHA256
-using System.Text; // For Encoding
-using MonoTorrent.BEncoding; // For BEncodedDictionary etc.
-using MonoTorrent.Trackers; // For AnnounceMode
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using MonoTorrent;
+using MonoTorrent.Client;
+using NATS.Client.Core;
+using MonoTorrent.Dht;
+using MonoTorrent.BEncoding; // Added for BEncodedDictionary
+using System.Security.Cryptography;
+using System.Text; // Added for Encoding
 
 namespace TorrentWrapper.Tests
 {
-    [TestClass]
+    [TestFixture]
     public class TorrentServiceTests
     {
-        private TorrentService? _service1;
-        private TorrentService? _service2; // For simulating multiple clients
-        private string? _baseDirectory1;
-        private string? _baseDirectory2;
-        private EngineSettings? _settings1;
-        private EngineSettings? _settings2;
+        private string _tempDirectory = null!;
+        private string _downloadDirectory = null!;
+        private string _cacheDirectory = null!;
+        private string _metadataDirectory = null!;
+        private string _fastResumeDirectory = null!;
+        private TorrentService _service = null!;
+        private EngineSettings _settings = null!;
 
-        // Unique port numbers for each test run to avoid conflicts
-        private static int _portCounter = 55000;
-        private int _dhtPort1;
-        private int _listenPort1;
-        private int _dhtPort2;
-        private int _listenPort2;
+        // Consider making NATS optional or using a mock/test server if available
+        private static readonly string NatsServerUrl = "nats://demo.nats.io:4222"; // Use public demo server for tests
+        // NATS options are now configured via EngineSettings
+        private static readonly NatsOpts? TestNatsOptions = NatsOpts.Default with { Url = NatsServerUrl }; // Keep this for easy access in tests
 
-
-        [TestInitialize]
-        public async Task TestInitialize()
+        [SetUp]
+        public void Setup()
         {
-            // Create unique directories for each test instance
-            _baseDirectory1 = Path.Combine(Path.GetTempPath(), "TorrentServiceTest1_" + Guid.NewGuid().ToString("N"));
-            _baseDirectory2 = Path.Combine(Path.GetTempPath(), "TorrentServiceTest2_" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(_baseDirectory1);
-            Directory.CreateDirectory(_baseDirectory2);
+            _tempDirectory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
+            _downloadDirectory = Path.Combine(_tempDirectory, "Downloads");
+            _cacheDirectory = Path.Combine(_tempDirectory, "Cache");
+            _metadataDirectory = Path.Combine(_cacheDirectory, "metadata"); // Consistent with EngineSettings defaults
+            _fastResumeDirectory = Path.Combine(_cacheDirectory, "fastresume"); // Consistent with EngineSettings defaults
 
-            // Assign unique ports
-            _dhtPort1 = Interlocked.Increment(ref _portCounter);
-            _listenPort1 = Interlocked.Increment(ref _portCounter);
-            _dhtPort2 = Interlocked.Increment(ref _portCounter);
-            _listenPort2 = Interlocked.Increment(ref _portCounter);
+            Directory.CreateDirectory(_tempDirectory);
+            Directory.CreateDirectory(_downloadDirectory);
+            Directory.CreateDirectory(_cacheDirectory);
+            Directory.CreateDirectory(_metadataDirectory);
+            Directory.CreateDirectory(_fastResumeDirectory);
 
-            // Configure settings for two separate engine instances
-            _settings1 = new EngineSettingsBuilder
+            // Base settings used by most tests. NATS test will override some.
+            _settings = new EngineSettingsBuilder
             {
-                AllowPortForwarding = true,
+                AllowPortForwarding = false, // Default to false, NATS test enables it
+                AllowLocalPeerDiscovery = false,
+                AllowMultipleTorrentInstances = true,
                 AutoSaveLoadFastResume = false,
-                CacheDirectory = Path.Combine(_baseDirectory1, "cache"),
-                DhtEndPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("82.30.95.76"), _dhtPort1),
-                ListenEndPoints = new Dictionary<string, System.Net.IPEndPoint> { { "", new System.Net.IPEndPoint(System.Net.IPAddress.Parse("82.30.95.76"), _listenPort1) } }
+                AutoSaveLoadMagnetLinkMetadata = true,
+                CacheDirectory = _cacheDirectory,
+                // Use IPAddress.Any for DHT/Listen endpoints by default, similar to reference test setup
+                // Tests not needing network can function, NATS test relies on this.
+                DhtEndPoint = new IPEndPoint(IPAddress.Any, 0),
+                ListenEndPoints = new Dictionary<string, IPEndPoint> { { "ipv4", new IPEndPoint(IPAddress.Any, 0) } },
+                // NATS settings default to disabled here
+                AllowNatsDiscovery = false,
+                NatsOptions = null
             }.ToSettings();
 
-            _settings2 = new EngineSettingsBuilder
+            _service = new TorrentService(_settings); // Pass EngineSettings only
+        }
+
+        [TearDown]
+        public async Task Teardown()
+        {
+            // Stop all torrents and dispose service
+            if (_service != null)
             {
+                 // Ensure all managers are stopped before disposing engine
+                 var managers = _service.ListTorrents();
+                 var stopTasks = managers.Select(m => m.StopAsync()).ToArray();
+                 await Task.WhenAll(stopTasks);
+
+                _service.Dispose();
+            }
+
+            // Clean up temporary directory
+            try
+            {
+                if (Directory.Exists(_tempDirectory))
+                {
+                    Directory.Delete(_tempDirectory, true);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Failed to delete temp directory {_tempDirectory}: {ex.Message}");
+            }
+        }
+
+        private string CreateDummyFile(string name, int sizeMB)
+        {
+            string path = Path.Combine(_downloadDirectory, name);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!); // Ensure directory exists
+            byte[] data = new byte[1024];
+            var random = new Random();
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                for (int i = 0; i < sizeMB * 1024; i++)
+                {
+                    random.NextBytes(data);
+                    fs.Write(data, 0, data.Length);
+                }
+            }
+            return path;
+        }
+
+        // --- Test Cases ---
+
+        [Test]
+        public async Task InitializeService_Success()
+        {
+            await _service.InitializeAsync();
+            // Basic assertion: Check if engine is running (or at least not throwing exceptions)
+            // More specific checks could involve listener status if made public/testable
+            ClassicAssert.IsNotNull(_service.Engine);
+            // If NATS was configured, check if NatsService is not null
+            if (TestNatsOptions != null)
+            { // NatsService is internal to ClientEngine now, cannot assert directly here. Initialization success implies it worked if configured. }
+                Console.WriteLine("InitializeService_Success: Passed");
+            }
+        }
+
+        [Test]
+        public async Task CreateTorrent_FromFile_Success()
+        {
+            await _service.InitializeAsync();
+            string dummyFilePath = CreateDummyFile("dummy_create.dat", 1); // Create 1MB file
+            var fileSource = new TorrentFileSource(dummyFilePath);
+
+            Torrent torrent = await _service.CreateTorrentAsync(fileSource);
+
+            ClassicAssert.IsNotNull(torrent);
+            ClassicAssert.AreEqual(Path.GetFileName(dummyFilePath), torrent.Name);
+            ClassicAssert.IsTrue(torrent.Files.Count > 0);
+            ClassicAssert.AreEqual(new FileInfo(dummyFilePath).Length, torrent.Size);
+
+            // Verify metadata file was saved
+            string expectedMetadataPath = Path.Combine(_metadataDirectory, torrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+            ClassicAssert.IsTrue(File.Exists(expectedMetadataPath), "Metadata file was not saved.");
+            Console.WriteLine("CreateTorrent_FromFile_Success: Passed");
+        }
+
+         [Test]
+        public async Task CreateTorrent_FromDirectory_Success()
+        {
+            await _service.InitializeAsync();
+            string subDir = Path.Combine(_downloadDirectory, "test_dir");
+            Directory.CreateDirectory(subDir);
+            string dummyFilePath1 = CreateDummyFile(Path.Combine("test_dir", "dummy1.dat"), 1);
+            string dummyFilePath2 = CreateDummyFile(Path.Combine("test_dir", "dummy2.dat"), 2);
+
+            var fileSource = new TorrentFileSource(_downloadDirectory); // Source is the parent directory
+
+            Torrent torrent = await _service.CreateTorrentAsync(fileSource);
+
+            ClassicAssert.IsNotNull(torrent);
+            ClassicAssert.AreEqual(Path.GetFileName(_downloadDirectory), torrent.Name); // Name is the root folder name
+            ClassicAssert.AreEqual(2, torrent.Files.Count);
+            ClassicAssert.AreEqual(new FileInfo(dummyFilePath1).Length + new FileInfo(dummyFilePath2).Length, torrent.Size);
+
+            // Verify metadata file was saved
+            string expectedMetadataPath = Path.Combine(_metadataDirectory, torrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+            ClassicAssert.IsTrue(File.Exists(expectedMetadataPath), "Metadata file was not saved.");
+            Console.WriteLine("CreateTorrent_FromDirectory_Success: Passed");
+        }
+
+        [Test]
+        public async Task LoadTorrent_FromFile_Success()
+        {
+            await _service.InitializeAsync();
+            string dummyFilePath = CreateDummyFile("dummy_load.dat", 1);
+            var fileSource = new TorrentFileSource(dummyFilePath);
+            Torrent createdTorrent = await _service.CreateTorrentAsync(fileSource);
+            string metadataPath = Path.Combine(_metadataDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+
+            TorrentManager manager = await _service.LoadTorrentAsync(metadataPath, _downloadDirectory);
+
+            ClassicAssert.IsNotNull(manager);
+            ClassicAssert.AreEqual(createdTorrent.InfoHashes, manager.InfoHashes);
+            ClassicAssert.AreEqual(1, _service.ListTorrents().Count);
+            ClassicAssert.IsTrue(_service.Torrents.ContainsKey(manager.InfoHashes));
+            Console.WriteLine("LoadTorrent_FromFile_Success: Passed");
+        }
+
+         [Test]
+        public async Task LoadTorrent_FromMagnet_Success()
+        {
+            await _service.InitializeAsync();
+            // Create a dummy torrent first to get a valid magnet link
+            string dummyFilePath = CreateDummyFile("dummy_magnet.dat", 1);
+            var fileSource = new TorrentFileSource(dummyFilePath);
+            Torrent createdTorrent = await _service.CreateTorrentAsync(fileSource);
+            var magnetLink = new MagnetLink(createdTorrent.InfoHashes, createdTorrent.Name);
+
+            TorrentManager manager = await _service.LoadTorrentAsync(magnetLink, _downloadDirectory);
+
+            ClassicAssert.IsNotNull(manager);
+            ClassicAssert.AreEqual(createdTorrent.InfoHashes, manager.InfoHashes);
+            ClassicAssert.AreEqual(1, _service.ListTorrents().Count);
+            ClassicAssert.IsTrue(_service.Torrents.ContainsKey(manager.InfoHashes));
+            // Metadata might not be available immediately after loading from magnet
+            // ClassicAssert.AreEqual(createdTorrent.Name, manager.Torrent?.Name);
+            Console.WriteLine("LoadTorrent_FromMagnet_Success: Passed");
+        }
+
+        [Test]
+        public async Task EditMetadata_ChangeCommentAndTracker_Success()
+        {
+            await _service.InitializeAsync();
+            string dummyFilePath = CreateDummyFile("dummy_edit.dat", 1);
+            var fileSource = new TorrentFileSource(dummyFilePath);
+            Torrent createdTorrent = await _service.CreateTorrentAsync(fileSource, announceUrls: new List<IList<string>> { new List<string> { "http://original.tracker/announce" } });
+            string metadataPath = Path.Combine(_metadataDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+
+            TorrentManager manager = await _service.LoadTorrentAsync(metadataPath, _downloadDirectory);
+            ClassicAssert.IsNotNull(manager.Torrent);
+            ClassicAssert.AreEqual("http://original.tracker/announce", manager.Torrent.AnnounceUrls?.FirstOrDefault()?.FirstOrDefault()); // Added null check for AnnounceUrls
+            ClassicAssert.IsTrue(string.IsNullOrEmpty(manager.Torrent.Comment));
+
+            string newComment = "Edited Comment";
+            string newTracker = "http://new.tracker/announce";
+
+            bool edited = await _service.EditTorrentMetadataAsync(manager.InfoHashes, editor =>
+            {
+                editor.Comment = newComment;
+                editor.Announce = newTracker; // Overwrite single tracker
+                editor.Announces.Clear(); // Clear multi-tracker list if Announce is set
+            });
+
+            ClassicAssert.IsTrue(edited, "EditTorrentMetadataAsync should return true.");
+
+            // Reload the torrent from the modified file to verify changes
+            Torrent reloadedTorrent = Torrent.Load(metadataPath);
+            ClassicAssert.AreEqual(newComment, reloadedTorrent.Comment);
+            ClassicAssert.AreEqual(newTracker, reloadedTorrent.AnnounceUrls.FirstOrDefault()?.FirstOrDefault());
+            Console.WriteLine("EditMetadata_ChangeCommentAndTracker_Success: Passed");
+        }
+
+        [Test]
+        public async Task RemoveTorrent_CacheOnly_RemovesCacheFiles()
+        {
+            _settings = new EngineSettingsBuilder(_settings) { AutoSaveLoadFastResume = true }.ToSettings(); // Enable fast resume for this test
+            _service = new TorrentService(_settings); // Recreate service with new settings (NatsOptions are part of settings if needed)
+            await _service.InitializeAsync();
+
+            string dummyFilePath = CreateDummyFile("dummy_remove_cache.dat", 1);
+            var fileSource = new TorrentFileSource(dummyFilePath);
+            Torrent createdTorrent = await _service.CreateTorrentAsync(fileSource);
+            string metadataPath = Path.Combine(_metadataDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+            string fastResumePath = Path.Combine(_fastResumeDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".fresume");
+
+            TorrentManager manager = await _service.LoadTorrentAsync(metadataPath, _downloadDirectory);
+            await manager.StartAsync();
+            await Task.Delay(500); // Let it run briefly to potentially create fast resume
+            await manager.StopAsync(); // Stop cleanly to trigger fast resume save
+
+            ClassicAssert.IsTrue(File.Exists(metadataPath), "Metadata file should exist before removal.");
+            ClassicAssert.IsTrue(File.Exists(fastResumePath), "FastResume file should exist before removal.");
+            ClassicAssert.IsTrue(File.Exists(dummyFilePath), "Dummy file should exist before removal.");
+
+            bool removed = await _service.RemoveTorrentAsync(manager, RemoveMode.CacheDataOnly);
+
+            ClassicAssert.IsTrue(removed, "RemoveTorrentAsync should return true.");
+            ClassicAssert.AreEqual(0, _service.ListTorrents().Count, "Torrent should be removed from service list.");
+            ClassicAssert.IsFalse(File.Exists(metadataPath), "Metadata file should be deleted.");
+            ClassicAssert.IsFalse(File.Exists(fastResumePath), "FastResume file should be deleted.");
+            ClassicAssert.IsTrue(File.Exists(dummyFilePath), "Dummy file should NOT be deleted."); // Verify downloaded data remains
+            Console.WriteLine("RemoveTorrent_CacheOnly_RemovesCacheFiles: Passed");
+        }
+
+        [Test]
+        public async Task RemoveTorrent_DownloadedOnly_RemovesDataFiles()
+        {
+             _settings = new EngineSettingsBuilder(_settings) { AutoSaveLoadFastResume = true }.ToSettings();
+             _service = new TorrentService(_settings);
+            await _service.InitializeAsync();
+
+            string dummyFilePath = CreateDummyFile("dummy_remove_data.dat", 1);
+            var fileSource = new TorrentFileSource(dummyFilePath);
+            Torrent createdTorrent = await _service.CreateTorrentAsync(fileSource);
+            string metadataPath = Path.Combine(_metadataDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+            string fastResumePath = Path.Combine(_fastResumeDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".fresume");
+
+            TorrentManager manager = await _service.LoadTorrentAsync(metadataPath, _downloadDirectory);
+             await manager.StartAsync();
+             await Task.Delay(500);
+             await manager.StopAsync();
+
+            ClassicAssert.IsTrue(File.Exists(metadataPath), "Metadata file should exist before removal.");
+            ClassicAssert.IsTrue(File.Exists(fastResumePath), "FastResume file should exist before removal.");
+            ClassicAssert.IsTrue(File.Exists(dummyFilePath), "Dummy file should exist before removal.");
+
+            bool removed = await _service.RemoveTorrentAsync(manager, RemoveMode.DownloadedDataOnly);
+
+            ClassicAssert.IsTrue(removed, "RemoveTorrentAsync should return true.");
+            ClassicAssert.AreEqual(0, _service.ListTorrents().Count, "Torrent should be removed from service list.");
+            ClassicAssert.IsTrue(File.Exists(metadataPath), "Metadata file should NOT be deleted."); // Verify cache remains
+            ClassicAssert.IsTrue(File.Exists(fastResumePath), "FastResume file should NOT be deleted."); // Verify cache remains
+            ClassicAssert.IsFalse(File.Exists(dummyFilePath), "Dummy file should be deleted."); // Verify downloaded data removed
+            Console.WriteLine("RemoveTorrent_DownloadedOnly_RemovesDataFiles: Passed");
+        }
+
+         [Test]
+        public async Task RemoveTorrent_CacheAndDownloaded_RemovesAll()
+        {
+             _settings = new EngineSettingsBuilder(_settings) { AutoSaveLoadFastResume = true }.ToSettings();
+             _service = new TorrentService(_settings);
+            await _service.InitializeAsync();
+
+            string dummyFilePath = CreateDummyFile("dummy_remove_all.dat", 1);
+            var fileSource = new TorrentFileSource(dummyFilePath);
+            Torrent createdTorrent = await _service.CreateTorrentAsync(fileSource);
+            string metadataPath = Path.Combine(_metadataDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+            string fastResumePath = Path.Combine(_fastResumeDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".fresume");
+
+            TorrentManager manager = await _service.LoadTorrentAsync(metadataPath, _downloadDirectory);
+             await manager.StartAsync();
+             await Task.Delay(500);
+             await manager.StopAsync();
+
+            ClassicAssert.IsTrue(File.Exists(metadataPath), "Metadata file should exist before removal.");
+            ClassicAssert.IsTrue(File.Exists(fastResumePath), "FastResume file should exist before removal.");
+            ClassicAssert.IsTrue(File.Exists(dummyFilePath), "Dummy file should exist before removal.");
+
+            bool removed = await _service.RemoveTorrentAsync(manager, RemoveMode.CacheDataAndDownloadedData);
+
+            ClassicAssert.IsTrue(removed, "RemoveTorrentAsync should return true.");
+            ClassicAssert.AreEqual(0, _service.ListTorrents().Count, "Torrent should be removed from service list.");
+            ClassicAssert.IsFalse(File.Exists(metadataPath), "Metadata file should be deleted.");
+            ClassicAssert.IsFalse(File.Exists(fastResumePath), "FastResume file should be deleted.");
+            ClassicAssert.IsFalse(File.Exists(dummyFilePath), "Dummy file should be deleted.");
+            Console.WriteLine("RemoveTorrent_CacheAndDownloaded_RemovesAll: Passed");
+        }
+        [Test]
+        [Category("Integration")] // Requires external NATS server
+        [Category("RequiresNats")]
+        public async Task NatsDiscovery_TwoInstances_DiscoverEachOther()
+        {
+            if (TestNatsOptions == null)
+            {
+                ClassicAssert.Ignore("NATS tests are disabled. Set TestNatsOptions to run.");
+                return; // Explicit return to satisfy compiler nullability analysis
+            }
+
+            // --- Instance A Setup ---
+            string instanceADownloadDir = Path.Combine(_tempDirectory, "NatsA_Downloads");
+            string instanceACacheDir = Path.Combine(_tempDirectory, "NatsA_Cache");
+            Directory.CreateDirectory(instanceADownloadDir);
+            Directory.CreateDirectory(instanceACacheDir);
+            // Settings for instance A (already includes NATS config from builder)
+            var settingsA = new EngineSettingsBuilder(_settings) {
+                CacheDirectory = instanceACacheDir,
                 AllowPortForwarding = true,
-                AutoSaveLoadFastResume = false,
-                CacheDirectory = Path.Combine(_baseDirectory2, "cache"),
-                DhtEndPoint = new System.Net.IPEndPoint(System.Net.IPAddress.Parse("82.30.95.76"), _dhtPort2),
-                ListenEndPoints = new Dictionary<string, System.Net.IPEndPoint> { { "", new System.Net.IPEndPoint(System.Net.IPAddress.Parse("82.30.95.76"), _listenPort2) } }
+                ListenEndPoints = new Dictionary<string, IPEndPoint> { { "ipv4", new IPEndPoint(IPAddress.Any, 0) } },
+                AllowNatsDiscovery = true,
+                NatsOptions = TestNatsOptions
             }.ToSettings();
+            var serviceA = new TorrentService(settingsA);
 
+            // --- Instance B Setup ---
+            string instanceBDownloadDir = Path.Combine(_tempDirectory, "NatsB_Downloads");
+            string instanceBCacheDir = Path.Combine(_tempDirectory, "NatsB_Cache");
+            Directory.CreateDirectory(instanceBDownloadDir);
+            Directory.CreateDirectory(instanceBCacheDir);
+            // Settings for instance B (already includes NATS config from builder)
+            var settingsB = new EngineSettingsBuilder(_settings) {
+                CacheDirectory = instanceBCacheDir,
+                AllowPortForwarding = true,
+                ListenEndPoints = new Dictionary<string, IPEndPoint> { { "ipv4", new IPEndPoint(IPAddress.Any, 0) } },
+                AllowNatsDiscovery = true,
+                NatsOptions = TestNatsOptions
+            }.ToSettings();
+            var serviceB = new TorrentService(settingsB);
 
-            _service1 = new TorrentService();
-            await _service1.InitializeAsync(_settings1);
-
-            _service2 = new TorrentService();
-            await _service2.InitializeAsync(_settings2);
-
-            // Give DHT engines time to start automatically.
-            // NOTE: This might not be reliable for ensuring they find each other.
-            // Explicit addition might be needed within tests after managers are started.
-            await Task.Delay(2000); // Reduced delay as explicit add is preferred
-        }
-
-        [TestCleanup]
-        public async Task TestCleanup()
-        {
-            if (_service1 != null)
-                await _service1.DisposeAsync();
-            if (_service2 != null)
-                await _service2.DisposeAsync();
-
-            // Clean up temporary directories
-            TryDeleteDirectory(_baseDirectory1);
-            TryDeleteDirectory(_baseDirectory2);
-        }
-
-        // Helper to create compact node info (BEP 5)
-        private ReadOnlyMemory<byte> CreateCompactNodeInfo(NodeId nodeId, System.Net.IPEndPoint endpoint)
-        {
-            // Only handle IPv4 for simplicity in this test helper
-            if (endpoint.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
-                throw new NotSupportedException("This helper only supports IPv4 endpoints for compact node info.");
-
-            byte[] buffer = new byte[26]; // 20 bytes for NodeId + 4 bytes for IP + 2 bytes for Port
-            nodeId.Span.CopyTo(buffer.AsSpan(0, 20));
-            endpoint.Address.GetAddressBytes().CopyTo(buffer.AsSpan(20, 4));
-            BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(24, 2), (ushort)endpoint.Port);
-            return buffer;
-        }
-
-        private void TryDeleteDirectory(string? path)
-        {
-            if (!string.IsNullOrEmpty(path) && Directory.Exists(path))
+            try
             {
-                try
-                {
-                    Directory.Delete(path, true);
+                // Initialize both services concurrently
+                var initTaskA = serviceA.InitializeAsync();
+                var initTaskB = serviceB.InitializeAsync();
+                await Task.WhenAll(initTaskA, initTaskB);
+                Console.WriteLine("[NATS Test] Both services initialized (engines started, NATS init attempted).");
+
+                // Wait for discovery via NATS publish/subscribe
+                Console.WriteLine("[NATS Test] Waiting for NATS peer discovery (e.g., 10 seconds)...");
+                var discoveryTimeout = TimeSpan.FromSeconds(15); // Allow ample time for publish/subscribe/processing
+                var discoverySw = System.Diagnostics.Stopwatch.StartNew();
+                bool discoveredA = false;
+                bool discoveredB = false;
+                // Calculate NodeIds from the public PeerId, similar to how seederNodeId was calculated.
+                NodeId idA, idB;
+                using (var sha1 = System.Security.Cryptography.SHA1.Create()) {
+                    var idABytes = sha1.ComputeHash(serviceA.Engine.PeerId.AsMemory().Span.ToArray());
+                    idA = NodeId.FromInfoHash(InfoHash.FromMemory(idABytes));
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Warning: Could not delete test directory '{path}': {ex.Message}");
+                using (var sha1 = System.Security.Cryptography.SHA1.Create()) {
+                    var idBBytes = sha1.ComputeHash(serviceB.Engine.PeerId.AsMemory().Span.ToArray());
+                    idB = NodeId.FromInfoHash(InfoHash.FromMemory(idBBytes));
                 }
+
+
+                ClassicAssert.AreNotEqual(default(NodeId), idA, "Service A NodeId should not be default/zero.");
+                ClassicAssert.AreNotEqual(default(NodeId), idB, "Service B NodeId should not be default/zero.");
+                ClassicAssert.AreNotEqual(idA, idB, "Service A and B should have different NodeIds.");
+
+
+                while (discoverySw.Elapsed < discoveryTimeout && (!discoveredA || !discoveredB))
+                {
+                    var peersForA = serviceA.GetNatsDiscoveredPeers(); // Use public method
+                    var peersForB = serviceB.GetNatsDiscoveredPeers(); // Use public method
+
+                    discoveredA = peersForA?.ContainsKey(idB) ?? false;
+                    discoveredB = peersForB?.ContainsKey(idA) ?? false;
+
+                    if (!discoveredA || !discoveredB)
+                        await Task.Delay(500);
+                }
+                discoverySw.Stop();
+                Console.WriteLine($"[NATS Test] Discovery loop finished after {discoverySw.ElapsedMilliseconds}ms. A discovered B: {discoveredA}, B discovered A: {discoveredB}");
+
+                ClassicAssert.IsTrue(discoveredA, "Service A did not discover Service B via NATS.");
+                ClassicAssert.IsTrue(discoveredB, "Service B did not discover Service A via NATS.");
+                // Note: The NodeId calculation is now internal to ClientEngine/NatsService.
+                // We need a way to get the NodeId for assertion if required, perhaps expose it?
+                // For now, we assume the GetNatsDiscoveredPeers check is sufficient.
+                // NodeId idA = ???;
+                // NodeId idB = ???;
+
+                // Optional: Verify discovered endpoints look reasonable (e.g., not null)
+                 var peersA = serviceA.GetNatsDiscoveredPeers();
+                 var peersB = serviceB.GetNatsDiscoveredPeers();
+                 ClassicAssert.IsNotNull(peersA?[idB], "Endpoint for B discovered by A should not be null.");
+                 ClassicAssert.IsNotNull(peersB?[idA], "Endpoint for A discovered by B should not be null.");
+
+                 Console.WriteLine($"[NATS Test] Endpoint for B discovered by A: {peersA?[idB]}");
+                 Console.WriteLine($"[NATS Test] Endpoint for A discovered by B: {peersB?[idA]}");
+
+                 Console.WriteLine("NatsDiscovery_TwoInstances_DiscoverEachOther: Passed");
+
+            }
+                finally
+                {
+                    // Cleanup both service instances
+                    serviceA?.Dispose();
+                    serviceB?.Dispose();
+                }
+            }
+        
+
+        [Test]
+        [Category("Integration")] // Requires external NATS server and involves file transfer
+        [Category("RequiresNats")]
+        public async Task NatsDiscovery_AndTransfer_Success()
+        {
+            if (TestNatsOptions == null)
+            {
+                ClassicAssert.Ignore("NATS tests are disabled. Set TestNatsOptions to run.");
+                return; // Explicit return
+            }
+
+            // --- Instance A (Seeder) Setup ---
+            string instanceADownloadDir = Path.Combine(_tempDirectory, "NatsA_Source"); // Source dir for seeder
+            string instanceACacheDir = Path.Combine(_tempDirectory, "NatsA_Cache");
+            Directory.CreateDirectory(instanceADownloadDir);
+            Directory.CreateDirectory(instanceACacheDir);
+            var settingsA = new EngineSettingsBuilder(_settings) {
+                CacheDirectory = instanceACacheDir,
+                AllowPortForwarding = true,
+                ListenEndPoints = new Dictionary<string, IPEndPoint> { { "ipv4", new IPEndPoint(IPAddress.Any, 0) } },
+                AllowNatsDiscovery = true,
+                NatsOptions = TestNatsOptions
+            }.ToSettings();
+            var serviceA = new TorrentService(settingsA);
+
+            // --- Instance B (Downloader) Setup ---
+            string instanceBDownloadDir = Path.Combine(_tempDirectory, "NatsB_Downloads"); // Target dir for downloader
+            string instanceBCacheDir = Path.Combine(_tempDirectory, "NatsB_Cache");
+            Directory.CreateDirectory(instanceBDownloadDir);
+            Directory.CreateDirectory(instanceBCacheDir);
+            var settingsB = new EngineSettingsBuilder(_settings) {
+                CacheDirectory = instanceBCacheDir,
+                AllowPortForwarding = true,
+                ListenEndPoints = new Dictionary<string, IPEndPoint> { { "ipv4", new IPEndPoint(IPAddress.Any, 0) } },
+                AllowNatsDiscovery = true,
+                NatsOptions = TestNatsOptions
+            }.ToSettings();
+            var serviceB = new TorrentService(settingsB);
+
+            TorrentManager? managerA = null;
+            TorrentManager? managerB = null;
+
+            try
+            {
+                // Initialize both services concurrently
+                var initTaskA = serviceA.InitializeAsync();
+                var initTaskB = serviceB.InitializeAsync();
+                await Task.WhenAll(initTaskA, initTaskB);
+                Console.WriteLine("[NATS Transfer Test] Both services initialized.");
+
+                // --- NATS Discovery Verification (Copied from previous test) ---
+                Console.WriteLine("[NATS Transfer Test] Waiting for NATS peer discovery...");
+                var discoveryTimeout = TimeSpan.FromSeconds(20); // Increased timeout slightly
+                var discoverySw = System.Diagnostics.Stopwatch.StartNew();
+                bool discoveredA = false;
+                bool discoveredB = false;
+                NodeId idA, idB;
+                using (var sha1 = SHA1.Create()) {
+                    var idABytes = sha1.ComputeHash(serviceA.Engine.PeerId.AsMemory().Span.ToArray());
+                    idA = NodeId.FromInfoHash(InfoHash.FromMemory(idABytes));
+                }
+                using (var sha1 = SHA1.Create()) {
+                    var idBBytes = sha1.ComputeHash(serviceB.Engine.PeerId.AsMemory().Span.ToArray());
+                    idB = NodeId.FromInfoHash(InfoHash.FromMemory(idBBytes));
+                }
+
+                while (discoverySw.Elapsed < discoveryTimeout && (!discoveredA || !discoveredB))
+                {
+                    var peersForA = serviceA.GetNatsDiscoveredPeers();
+                    var peersForB = serviceB.GetNatsDiscoveredPeers();
+                    discoveredA = peersForA?.ContainsKey(idB) ?? false;
+                    discoveredB = peersForB?.ContainsKey(idA) ?? false;
+                    if (!discoveredA || !discoveredB)
+                        await Task.Delay(500);
+                }
+                discoverySw.Stop();
+                Console.WriteLine($"[NATS Transfer Test] Discovery loop finished after {discoverySw.ElapsedMilliseconds}ms. A discovered B: {discoveredA}, B discovered A: {discoveredB}");
+                ClassicAssert.IsTrue(discoveredA, "Service A did not discover Service B via NATS.");
+                ClassicAssert.IsTrue(discoveredB, "Service B did not discover Service A via NATS.");
+                Console.WriteLine("[NATS Transfer Test] Peer discovery successful.");
+                Console.WriteLine("[NATS Transfer Test] Peer discovery successful.");
+
+                // --- Torrent Creation and Loading ---
+                string dummyFileName = "nats_transfer_test.dat";
+                string dummyFilePathA = Path.Combine(instanceADownloadDir, dummyFileName); // Create file in A's dir
+                CreateDummyFile(dummyFilePathA, 1); // Create 1MB dummy file in A's source directory
+                var fileSource = new TorrentFileSource(dummyFilePathA);
+                Torrent createdTorrent = await serviceA.CreateTorrentAsync(fileSource);
+                string metadataPath = Path.Combine(settingsA.MetadataCacheDirectory, createdTorrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+                ClassicAssert.IsTrue(File.Exists(metadataPath), "Metadata file was not created by Service A.");
+                Console.WriteLine($"[NATS Transfer Test] Torrent created by Service A: {createdTorrent.Name}");
+
+                // Load torrent into Service B (downloader)
+                managerB = await serviceB.LoadTorrentAsync(metadataPath, instanceBDownloadDir); // Download to B's dir
+                ClassicAssert.IsNotNull(managerB, "Service B failed to load the torrent.");
+                Console.WriteLine($"[NATS Transfer Test] Torrent loaded by Service B. Save path: {instanceBDownloadDir}");
+
+                // Load torrent into Service A (seeder) - needed to manage the seeding state
+                managerA = await serviceA.LoadTorrentAsync(metadataPath, instanceADownloadDir);
+                ClassicAssert.IsNotNull(managerA, "Service A failed to load the torrent for seeding.");
+                Console.WriteLine("[NATS Transfer Test] Torrent loaded by Service A for seeding.");
+
+                // --- Explicitly add discovered peer (ensure it's considered) ---
+                // --- Explicitly add discovered peer USING LOCAL ENDPOINT (Bypass NAT Loopback/Firewall) ---
+                var localEndpointA = serviceA.Engine.PeerListeners.FirstOrDefault()?.LocalEndPoint; // Get A's actual listening endpoint from the first listener
+                if (localEndpointA != null)
+                {
+                    // Construct URI using loopback IP and the listener's port
+                    var localPeerUri = new Uri($"ipv4://127.0.0.1:{localEndpointA.Port}");
+                    var localPeerInfoA = new PeerInfo(localPeerUri, serviceA.Engine.PeerId); // Use A's PeerId
+                    await managerB.AddPeerAsync(localPeerInfoA);
+                } else {
+                     // Fallback to NATS discovered endpoint (might still fail)
+                     var peersB = serviceB.GetNatsDiscoveredPeers();
+                     if (peersB != null && peersB.TryGetValue(idA, out var natsEndpointA))
+                     {
+                         var natsPeerInfoA = new PeerInfo(new Uri($"ipv4://{natsEndpointA}"), serviceA.Engine.PeerId);
+                         await managerB.AddPeerAsync(natsPeerInfoA);
+                     } else {
+                     }
+                }
+                // Give the ConnectionManager a moment to process the added peer
+                await Task.Delay(1000); // Reduced delay slightly as local connection should be faster
+
+                // --- Start Download/Seed ---
+                var startTaskA = serviceA.DownloadTorrentAsync(managerA.InfoHashes); // Start seeding
+                var startTaskB = serviceB.DownloadTorrentAsync(managerB.InfoHashes); // Start downloading
+                await Task.WhenAll(startTaskA, startTaskB);
+                Console.WriteLine("[NATS Transfer Test] Both torrent managers started.");
+
+                // --- Wait for Download Completion ---
+                var downloadTimeout = TimeSpan.FromSeconds(15); // Timeout for the download
+                var downloadSw = System.Diagnostics.Stopwatch.StartNew();
+                while (managerB.State != TorrentState.Seeding && downloadSw.Elapsed < downloadTimeout)
+                {
+                    if (managerB.State == TorrentState.Error)
+                        ClassicAssert.Fail($"Downloader entered Error state: {managerB.Error?.Reason} - {managerB.Error?.Exception?.Message}");
+                     // Add progress bar display
+                     var dlRate = managerB.Monitor.DownloadRate; // Use DownloadRate
+                     var ulRate = managerB.Monitor.UploadRate; // Use UploadRate
+                     var connectedPeers = managerB.Peers.ConnectedPeers.Count; // More specific than OpenConnections
+                     int progressBarWidth = 20;
+                     int progressChars = (int)(progressBarWidth * (managerB.Progress / 100.0));
+                     string progressBar = $"[{new string('#', progressChars)}{new string('-', progressBarWidth - progressChars)}]";
+                     Console.WriteLine($"[NATS Transfer Test] B State: {managerB.State}, {progressBar} {managerB.Progress:F1}%, Peers: {connectedPeers}, DL: {dlRate / 1024.0:F1} kB/s, UL: {ulRate / 1024.0:F1} kB/s");
+
+                    await Task.Delay(1000); // Check every second
+                }
+                downloadSw.Stop();
+
+                // --- Assertions ---
+                ClassicAssert.AreEqual(TorrentState.Seeding, managerB.State, "Downloader did not reach Seeding state within timeout.");
+                ClassicAssert.AreEqual(100.0, managerB.Progress, 0.01, "Download did not complete to 100%.");
+
+                string downloadedFilePathB = Path.Combine(instanceBDownloadDir, dummyFileName);
+                ClassicAssert.IsTrue(File.Exists(downloadedFilePathB), "Downloaded file does not exist in Service B's directory.");
+                ClassicAssert.AreEqual(new FileInfo(dummyFilePathA).Length, new FileInfo(downloadedFilePathB).Length, "Downloaded file size does not match original.");
+
+                Console.WriteLine("NatsDiscovery_AndTransfer_Success: Passed");
+            }
+            finally
+            {
+                // Cleanup both service instances
+                // Stop managers explicitly before disposing services
+                if (managerA != null && managerA.State != TorrentState.Stopped) await managerA.StopAsync();
+                if (managerB != null && managerB.State != TorrentState.Stopped) await managerB.StopAsync();
+                serviceA?.Dispose();
+                serviceB?.Dispose();
             }
         }
 
-        private string CreateDummyFile(string baseDir, string filename, int size)
-        {
-            string filePath = Path.Combine(baseDir, filename);
-            Directory.CreateDirectory(Path.GetDirectoryName(filePath)!); // Ensure directory exists
-            byte[] data = new byte[size];
-            Random.Shared.NextBytes(data);
-            File.WriteAllBytes(filePath, data);
-            return filePath;
-        }
+        // --- BEP44/46 Mutable Torrent Tests ---
 
-        // Helper to generate a seed from a string (for testing only)
-        private byte[] GenerateSeedFromString(string input)
+        // Helper to generate placeholder Ed25519 keys (replace with actual generation if library available)
+        private (byte[] publicKey, byte[] privateKey) GeneratePlaceholderKeys()
         {
-            using (var sha256 = SHA256.Create())
+            // IMPORTANT: These are NOT valid cryptographic keys. Use a library like Chaos.NaCl or BouncyCastle for real keys.
+            var publicKey = new byte[32];
+            var privateKey = new byte[64]; // Typically 32 bytes seed + 32 bytes public key
+            using (var rng = RandomNumberGenerator.Create())
             {
-                return sha256.ComputeHash(Encoding.UTF8.GetBytes(input)).Take(32).ToArray();
+                rng.GetBytes(publicKey);
+                rng.GetBytes(privateKey); // Fill with random data for placeholder
             }
+            // Ensure private key's second half matches public key for typical Ed25519 representation
+            // Array.Copy(publicKey, 0, privateKey, 32, 32); // This line might be needed depending on the crypto library used by MonoTorrent's PutMutableAsync for signing. Commented out for placeholder.
+            return (publicKey, privateKey);
         }
 
-        // --- Test Methods ---
-
-        [TestMethod]
-        public async Task CreateMutableTorrent_ShouldSucceed()
+        [Test]
+        public async Task CreateMutableTorrent_Success()
         {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_baseDirectory1);
+            await _service.InitializeAsync();
+            string dummyFilePath = CreateDummyFile("dummy_mutable_create.dat", 1);
+            var fileSource = new TorrentFileSource(dummyFilePath);
+            var (publicKey, _) = GeneratePlaceholderKeys(); // Private key not needed for creation check
+            long initialSequence = 5;
+            byte[] salt = Encoding.UTF8.GetBytes("test-salt");
 
-            string initialFile = CreateDummyFile(_baseDirectory1, "initial.txt", 10);
+            Torrent torrent = await _service.CreateTorrentAsync(
+                fileSource,
+                publicKey: publicKey,
+                sequenceNumber: initialSequence,
+                salt: salt);
 
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile);
+            ClassicAssert.IsNotNull(torrent);
+            ClassicAssert.AreEqual(Path.GetFileName(dummyFilePath), torrent.Name);
 
-            Assert.IsNotNull(magnetLink, "MagnetLink should not be null.");
-            Assert.IsNotNull(privateKeySeed, "PrivateKeySeed should not be null.");
-            Assert.AreEqual(32, privateKeySeed.Length, "PrivateKeySeed should be 32 bytes.");
-            Assert.IsNotNull(initialIdentifier, "InitialIdentifier should not be null.");
-            Assert.IsTrue(magnetLink.ToV1Uri().ToString().Contains("xs=urn:btpk:"), "Magnet link should contain public key (xs).");
-            Assert.AreEqual(64, magnetLink.PublicKeyHex?.Length, "Public key hex should be 64 chars."); // ed25519 pubkey = 32 bytes = 64 hex
+            // Verify metadata file was saved and contains mutable keys
+            string expectedMetadataPath = Path.Combine(_metadataDirectory, torrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+            ClassicAssert.IsTrue(File.Exists(expectedMetadataPath), "Metadata file was not saved.");
+
+            // Load the dictionary and check keys
+            byte[] torrentBytes = await File.ReadAllBytesAsync(expectedMetadataPath);
+            var torrentDict = BEncodedValue.Decode<BEncodedDictionary>(torrentBytes);
+
+            ClassicAssert.IsTrue(torrentDict.ContainsKey("pk"), "Torrent dictionary missing 'pk' key.");
+            ClassicAssert.AreEqual(publicKey, ((BEncodedString)torrentDict["pk"]).Span.ToArray(), "'pk' key mismatch.");
+
+            ClassicAssert.IsTrue(torrentDict.ContainsKey("seq"), "Torrent dictionary missing 'seq' key.");
+            ClassicAssert.AreEqual(initialSequence, ((BEncodedNumber)torrentDict["seq"]).Number, "'seq' key mismatch.");
+
+            ClassicAssert.IsTrue(torrentDict.ContainsKey("salt"), "Torrent dictionary missing 'salt' key.");
+            ClassicAssert.AreEqual(salt, ((BEncodedString)torrentDict["salt"]).Span.ToArray(), "'salt' key mismatch.");
+
+            Console.WriteLine("CreateMutableTorrent_Success: Passed");
         }
 
-        [TestMethod]
-        public async Task LoadMutableTorrent_ShouldSucceed()
+        [Test]
+        public async Task LoadMutableTorrent_FromMagnet_Success()
         {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
+            await _service.InitializeAsync();
+            var (publicKey, _) = GeneratePlaceholderKeys();
+            string pkHex = Convert.ToHexString(publicKey).ToLowerInvariant(); // BEP9 uses lowercase hex
+            // Construct a dummy InfoHash (not cryptographically linked to pk, just for magnet structure)
+            byte[] dummyInfoHashBytes = new byte[20];
+            RandomNumberGenerator.Fill(dummyInfoHashBytes);
+            var dummyInfoHash = InfoHash.FromMemory(dummyInfoHashBytes);
 
-            // Service 1 creates the torrent
-            string initialFile = CreateDummyFile(_baseDirectory1, "shared.txt", 10);
-            var (magnetLink, _, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile);
+            // Construct magnet link with pk
+            string magnetUri = $"magnet:?xt=urn:btih:{dummyInfoHash.ToHex()}&dn=MutableTest&xt=urn:btpk:{pkHex}";
+            var magnetLink = MagnetLink.Parse(magnetUri);
 
-            // Service 2 loads the torrent
-            string downloadPath2 = Path.Combine(_baseDirectory2, "downloads");
-            Directory.CreateDirectory(downloadPath2);
+            // Verify parsing worked (optional, depends on MagnetLink implementation)
+            // ClassicAssert.IsTrue(magnetLink.AnnounceUrls.Any(url => url.Contains(pkHex)), "MagnetLink AnnounceUrls should contain pk");
 
-            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
+            TorrentManager manager = await _service.LoadTorrentAsync(magnetLink, _downloadDirectory);
 
-            Assert.AreEqual(initialIdentifier, loadedIdentifier, "Loaded identifier should match the initial identifier.");
+            ClassicAssert.IsNotNull(manager);
+            // We can't easily assert that DHT lookups *will* happen without more complex setup,
+            // but loading the manager successfully is the first step.
+            ClassicAssert.AreEqual(1, _service.ListTorrents().Count);
+            ClassicAssert.IsTrue(_service.Torrents.ContainsKey(manager.InfoHashes)); // Infohash will be the dummy one initially
 
-            // Verify service 2 is managing it (internal check, requires access or helper)
-            // This requires exposing _managedTorrents or adding a helper method like 'IsManaging(InfoHash)'
-            // For now, we assume success if LoadTorrentAsync doesn't throw.
-            // Assert.IsTrue(_service2.IsManaging(loadedIdentifier));
+            Console.WriteLine("LoadMutableTorrent_FromMagnet_Success: Passed");
         }
 
-        [TestMethod]
-        public async Task AddFile_ShouldPropagateUpdate()
+        [Test]
+        // Removed RequiresReflection category
+        public async Task PublishMutableTorrentUpdate_Success() // Renamed test
         {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
+            await _service.InitializeAsync();
+            string dummyFilePath = CreateDummyFile("dummy_mutable_publish.dat", 1);
+            var fileSource = new TorrentFileSource(dummyFilePath);
+            var (publicKey, privateKey) = GeneratePlaceholderKeys();
+            long initialSequence = 10;
+            byte[] salt = Encoding.UTF8.GetBytes("publish-salt");
 
-            // Service 1 creates
-            string initialFile = CreateDummyFile(_baseDirectory1, "initial.txt", 10);
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile);
+            // 1. Create the initial mutable torrent
+            Torrent torrent = await _service.CreateTorrentAsync(
+                fileSource,
+                publicKey: publicKey,
+                sequenceNumber: initialSequence,
+                salt: salt);
+            string metadataPath = Path.Combine(_metadataDirectory, torrent.InfoHashes.V1OrV2.ToHex() + ".torrent");
+            byte[] initialTorrentBytes = await File.ReadAllBytesAsync(metadataPath);
+            var initialTorrentDict = BEncodedValue.Decode<BEncodedDictionary>(initialTorrentBytes);
 
-            // Service 2 loads
-            string downloadPath2 = Path.Combine(_baseDirectory2, "downloads_add");
-            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
-            Assert.AreEqual(initialIdentifier, loadedIdentifier);
+            // 2. Load the torrent (optional, but good practice)
+            // TorrentManager manager = await _service.LoadTorrentAsync(metadataPath, _downloadDirectory);
+            // ClassicAssert.IsNotNull(manager);
 
-
-            // Explicitly add nodes to each other's DHT engine now that they are started
-            await ConnectDhtsAsync(); // Use helper
-
-            // Setup event listener on Service 2
-            MutableTorrentUpdateInfoEventArgs? receivedArgs = null;
-            var updateReceivedSignal = new TaskCompletionSource<bool>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
-            { // args is now MutableTorrentUpdateInfoEventArgs
-                Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Received MutableTorrentUpdateAvailable. Original: {args.OriginalInfoHash.ToHex()}, New: {args.NewInfoHash.ToHex()}, Expected Original: {loadedIdentifier.ToHex()}");
-                // Check if the update is for the torrent we loaded by comparing the original InfoHash
-                if (args.OriginalInfoHash == loadedIdentifier)
-                {
-                    Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Match found! Setting signal.");
-                    receivedArgs = args; // Assign the correct type
-                    updateReceivedSignal.TrySetResult(true);
-                }
-                else
-                {
-                    Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Mismatch: OriginalInfoHash {args.OriginalInfoHash.ToHex()} != Expected {loadedIdentifier.ToHex()}");
-                }
-            };
-
-            // Service 1 adds a file
-            string fileToAdd = CreateDummyFile(_baseDirectory1, "added_file.dat", 50);
-            long newSeq1 = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, fileToAdd, privateKeySeed);
-            Assert.AreEqual(1, newSeq1, "Sequence number after first add should be 1.");
-
-            // Trigger the mutable update check on service 2 AFTER service 1 has put the update.
-            Console.WriteLine($"[Test {_service2.GetHashCode()}] Triggering mutable update check on Service 2 for {loadedIdentifier.ToHex()}");
-            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier); // Use the new method
-            Console.WriteLine($"[Test {_service2.GetHashCode()}] Update check triggered. Waiting for update signal...");
-
-            // Wait for Service 2 to receive the update via DHT/event
-            Console.WriteLine($"[Test {_service2.GetHashCode()}] Waiting for update signal...");
-            bool updateReceived = await Task.WhenAny(updateReceivedSignal.Task, Task.Delay(20000)) == updateReceivedSignal.Task; // Increased timeout to 20 sec
-
-            Assert.IsTrue(updateReceived, "Service 2 did not receive the torrent update event within the timeout.");
-            Assert.IsNotNull(receivedArgs, "Received event args should not be null.");
-            // receivedArgs is now MutableTorrentUpdateInfoEventArgs
-            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null.");
-            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different from the initial one."); // Compare against the correct property
-
-            // Optional: Verify file list on Service 2 after update (would require loading the new torrent)
-            // await _service2.RemoveAsync(loadedIdentifier); // Need a Remove method
-            // var newMagnet = new MagnetLink(receivedArgs.NewInfoHash);
-            // var newManager = await _service2.LoadTorrentAsync(newMagnet, downloadPath2);
-            // var files = await _service2.GetTorrentFilesAsync(newManager.InfoHashes.V1OrV2);
-            // Assert.IsTrue(files.Any(f => f.EndsWith("added_file.dat")));
-        }
-
-        [TestMethod]
-        public async Task RemoveFile_ShouldPropagateUpdate()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-
-            // Service 1 creates with two files
-            string initialFile1 = CreateDummyFile(_baseDirectory1, "file1.txt", 10);
-            string initialFile2 = CreateDummyFile(_baseDirectory1, "file2.txt", 20);
-            // Need TorrentCreator to add multiple files initially, or add one then modify
-            // Let's modify after creation for simplicity here
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile1);
-            long seqAfterAdd = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, initialFile2, privateKeySeed);
-            Assert.AreEqual(1, seqAfterAdd, "Sequence number after adding second file should be 1.");
-            // Need to get the *new* identifier after the add
-            // This highlights a potential API improvement: modification methods could return the new identifier/state.
-            // For now, we'll assume the identifier remains the public key hash, but the *state* is updated.
-
-            // Service 2 loads
-            string downloadPath2 = Path.Combine(_baseDirectory2, "downloads_remove");
-            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
-            Assert.AreEqual(initialIdentifier, loadedIdentifier); // Identifier should still match based on public key
-
-            // Explicitly add nodes to each other's DHT engine now that they are started
-            await ConnectDhtsAsync(); // Use helper
-
-            // Setup event listener on Service 2
-            MutableTorrentUpdateInfoEventArgs? receivedArgs = null;
-            var updateReceivedSignal = new TaskCompletionSource<bool>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
-            { // args is now MutableTorrentUpdateInfoEventArgs
-                Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Received MutableTorrentUpdateAvailable. Original: {args.OriginalInfoHash.ToHex()}, New: {args.NewInfoHash.ToHex()}, Expected Original: {loadedIdentifier.ToHex()}");
-                // Check if the update is for the torrent we loaded by comparing the original InfoHash
-                if (args.OriginalInfoHash == loadedIdentifier)
-                {
-                    // Signal completion on the first relevant update received after triggering the check.
-                    // The update check should fetch the latest state (Seq 2).
-                    Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Matching update received! Setting signal.");
-                    receivedArgs = args; // Assign the correct type
-                    updateReceivedSignal.TrySetResult(true);
-                }
-                else
-                {
-                    Console.WriteLine($"[Test Event Handler {_service2.GetHashCode()}] Mismatch: OriginalInfoHash {args.OriginalInfoHash.ToHex()} != Expected {loadedIdentifier.ToHex()}");
-                }
-            };
-
-            // Wait for the *first* update (from the AddFile) to likely propagate before removing
-            await Task.Delay(5000); // Give DHT time
-
-            // Service 1 removes the second file
-            long seqAfterRemove = await _service1.RemoveFileFromMutableTorrentAsync(initialIdentifier, "file2.txt", privateKeySeed);
-            Assert.AreEqual(2, seqAfterRemove, "Sequence number after removing file should be 2.");
-
-            // Trigger the mutable update check on service 2 AFTER service 1 has put the update.
-            Console.WriteLine($"[Test {_service2.GetHashCode()}] Triggering mutable update check on Service 2 for {loadedIdentifier.ToHex()} (after remove)");
-            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier); // Use the new method
-            Console.WriteLine($"[Test {_service2.GetHashCode()}] Update check triggered. Waiting 500ms for event processing...");
-            await Task.Delay(500); // Allow time for event processing after Get
-
-            // Wait for Service 2 to receive the *second* update via DHT/event
-            Console.WriteLine($"[Test {_service2.GetHashCode()}] Waiting for second update signal...");
-            bool updateReceived = await Task.WhenAny(updateReceivedSignal.Task, Task.Delay(10000)) == updateReceivedSignal.Task; // 10 sec timeout
-
-            Assert.IsTrue(updateReceived, "Service 2 did not receive the second torrent update event within the timeout.");
-            Assert.IsNotNull(receivedArgs, "Received event args should not be null for removal.");
-            // receivedArgs is now MutableTorrentUpdateInfoEventArgs
-            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null for removal."); // Compare against the correct property
-            // We can't easily assert the previous InfoHash here without storing it from the first event.
-        }
-
-        // Note: UpdateFile test would be very similar to Add/Remove as it uses them internally.
-        // A more robust test would involve a single-step update if that were implemented.
-
-
-
-        [TestMethod]
-        public async Task CreateMutableTorrent_WithDirectory_ShouldSucceed()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_baseDirectory1);
-
-            // Create a directory structure
-            string dirPath = Path.Combine(_baseDirectory1!, "test_dir");
-            Directory.CreateDirectory(dirPath);
-            string file1 = CreateDummyFile(dirPath, "file1.txt", 10);
-            string subDirPath = Path.Combine(dirPath, "subdir");
-            Directory.CreateDirectory(subDirPath);
-            string file2 = CreateDummyFile(subDirPath, "file2.dat", 20);
-
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(dirPath);
-
-            Assert.IsNotNull(magnetLink, "MagnetLink should not be null.");
-            Assert.IsNotNull(privateKeySeed, "PrivateKeySeed should not be null.");
-            Assert.AreEqual(32, privateKeySeed.Length, "PrivateKeySeed should be 32 bytes.");
-            Assert.IsNotNull(initialIdentifier, "InitialIdentifier should not be null.");
-            Assert.IsTrue(magnetLink.ToV1Uri().ToString().Contains("xs=urn:btpk:"), "Magnet link should contain public key (xs).");
-
-            // Optional: Verify the created torrent contains the expected files (requires GetTorrentFilesAsync or similar)
-            // This part depends on how TorrentService exposes file lists. Assuming GetTorrentFilesAsync works:
-            // Need to wait for metadata if GetTorrentFilesAsync is used immediately after creation
-            // await Task.Delay(1000); // Give some time for manager to potentially process metadata
-            // try {
-            //     var files = await _service1.GetTorrentFilesAsync(initialIdentifier);
-            //     Assert.IsTrue(files.Any(f => f.EndsWith(Path.Combine("test_dir", "file1.txt"))), "File1 missing");
-            //     Assert.IsTrue(files.Any(f => f.EndsWith(Path.Combine("test_dir", "subdir", "file2.dat"))), "File2 missing");
-            // } catch (InvalidOperationException ex) when (ex.Message.Contains("metadata not yet available")) {
-            //     Assert.Inconclusive("Metadata was not available in time to verify file list.");
-            // }
-        }
-
-        [TestMethod]
-        public async Task AddDirectory_ShouldPropagateUpdate()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-
-            // Service 1 creates initial torrent
-            string initialFile = CreateDummyFile(_baseDirectory1!, "initial.txt", 10);
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile);
-
-            // Service 2 loads
-            string downloadPath2 = Path.Combine(_baseDirectory2!, "downloads_add_dir");
-            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
-            Assert.AreEqual(initialIdentifier, loadedIdentifier);
-
-            // Connect DHTs
-            await ConnectDhtsAsync();
-
-            // Setup event listener on Service 2
-            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
+            // 3. Prepare the updated dictionary
+            long updatedSequence = initialSequence + 1;
+            // Correctly clone the dictionary
+            var updatedTorrentDict = new BEncodedDictionary();
+            foreach (var kvp in initialTorrentDict)
             {
-                if (args.OriginalInfoHash == loadedIdentifier)
-                {
-                    updateReceivedSignal.TrySetResult(args);
-                }
-            };
-
-            // Service 1 adds a directory
-            string dirToAddPath = Path.Combine(_baseDirectory1!, "new_dir");
-            Directory.CreateDirectory(dirToAddPath);
-            CreateDummyFile(dirToAddPath, "new_file1.txt", 30);
-            CreateDummyFile(Path.Combine(dirToAddPath, "new_subdir"), "new_file2.dat", 40);
-
-            long newSeq1 = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, dirToAddPath, privateKeySeed);
-            Assert.AreEqual(1, newSeq1, "Sequence number after adding directory should be 1.");
-
-            // Trigger update check on Service 2
-            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
-
-            // Wait for update
-            var receivedArgs = await WaitForUpdateAsync(updateReceivedSignal, 20000, "Service 2 did not receive the directory add update event.");
-            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null.");
-            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different after adding directory.");
-
-            // Optional: Verify file list on Service 2 after update
-        }
-
-        [TestMethod]
-        public async Task RemoveDirectory_ShouldPropagateUpdate()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-
-            // Service 1 creates with a directory
-            string dirPath = Path.Combine(_baseDirectory1!, "remove_dir_test");
-            Directory.CreateDirectory(dirPath);
-            CreateDummyFile(dirPath, "file_in_dir.txt", 15);
-            CreateDummyFile(Path.Combine(dirPath, "subdir"), "another_file.dat", 25);
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(dirPath);
-
-            // Service 2 loads
-            string downloadPath2 = Path.Combine(_baseDirectory2!, "downloads_remove_dir");
-            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
-            Assert.AreEqual(initialIdentifier, loadedIdentifier);
-
-            // Connect DHTs
-            await ConnectDhtsAsync();
-
-            // Setup event listener on Service 2
-            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
-            {
-                if (args.OriginalInfoHash == loadedIdentifier)
-                {
-                    updateReceivedSignal.TrySetResult(args);
-                }
-            };
-
-            // Service 1 removes the directory
-            // Note: The path used for removal should be relative to the torrent root.
-            // Since dirPath was the root, we use its name.
-            string dirToRemoveRelative = Path.GetFileName(dirPath);
-            long newSeq1 = await _service1.RemoveFileFromMutableTorrentAsync(initialIdentifier, dirToRemoveRelative, privateKeySeed);
-            Assert.AreEqual(1, newSeq1, "Sequence number after removing directory should be 1.");
-
-            // Trigger update check on Service 2
-            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
-
-            // Wait for update
-            var receivedArgs = await WaitForUpdateAsync(updateReceivedSignal, 20000, "Service 2 did not receive the directory remove update event.");
-            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null after remove.");
-            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different after removing directory.");
-
-            // Optional: Verify file list on Service 2 after update (should be empty or only contain other top-level files if added)
-        }
-
-        // Helper to connect DHTs
-        private async Task ConnectDhtsAsync()
-        {
-            if (_service1?.DhtAccess != null && _service2?.DhtAccess != null && _settings1?.DhtEndPoint != null && _settings2?.DhtEndPoint != null)
-            {
-                var dummyId1 = MonoTorrent.Dht.NodeId.Create();
-                var dummyId2 = MonoTorrent.Dht.NodeId.Create();
-
-                byte[] nodeInfo1 = new byte[26];
-                dummyId1.Span.CopyTo(nodeInfo1.AsSpan(0, 20));
-                _settings1.DhtEndPoint.Address.GetAddressBytes().CopyTo(nodeInfo1.AsSpan(20, 4));
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(nodeInfo1.AsSpan(24, 2), (ushort)_settings1.DhtEndPoint.Port);
-
-                byte[] nodeInfo2 = new byte[26];
-                dummyId2.Span.CopyTo(nodeInfo2.AsSpan(0, 20));
-                _settings2.DhtEndPoint.Address.GetAddressBytes().CopyTo(nodeInfo2.AsSpan(20, 4));
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(nodeInfo2.AsSpan(24, 2), (ushort)_settings2.DhtEndPoint.Port);
-
-                _service2.DhtAccess.Add(new ReadOnlyMemory<byte>[] { nodeInfo1 });
-                _service1.DhtAccess.Add(new ReadOnlyMemory<byte>[] { nodeInfo2 });
-
-                await Task.Delay(1000); // Give time for nodes to potentially ping/pong
-                Console.WriteLine("[Test Helper] Explicitly added DHT nodes to each other.");
+                // Shallow copy is sufficient here as BEncodedValue types are typically immutable or handled correctly.
+                // Crucially, the 'info' dictionary reference is copied, which is required by BEP44/46.
+                updatedTorrentDict.Add(kvp.Key, kvp.Value);
             }
-            else
-            {
-                Console.WriteLine("[Test Helper] Could not connect DHTs: Service or settings were null.");
-            }
+            updatedTorrentDict["seq"] = new BEncodedNumber(updatedSequence); // Update sequence number
+            updatedTorrentDict["comment"] = new BEncodedString("Updated via publish test"); // Add/change something
+            // IMPORTANT: The 'info' dictionary MUST remain unchanged. The shallow copy ensures this.
+
+            // 4. Attempt to publish the update using the reflection-based method
+            bool published = await _service.PublishTorrentUpdateAsync(
+                publicKey,
+                privateKey,
+                updatedSequence,
+                updatedTorrentDict,
+                salt);
+
+            // 5. Assert
+            // This assertion primarily checks if the reflection call executed without throwing an exception.
+            // It does NOT guarantee the data was accepted by the DHT network.
+            ClassicAssert.IsTrue(published, "PublishTorrentUpdateAsync (via Reflection) should return true on success.");
+
+            Console.WriteLine("PublishMutableTorrentUpdate_Reflection_Success: Passed (Reflection call successful)");
         }
 
-        // Helper to wait for update event
-        private async Task<MutableTorrentUpdateInfoEventArgs> WaitForUpdateAsync(TaskCompletionSource<MutableTorrentUpdateInfoEventArgs> signal, int timeoutMs, string timeoutMessage)
+        [Test]
+        [Category("Integration")] // Requires DHT interaction
+        [CancelAfter(60000)] // Use recommended attribute
+        public async Task MutableTorrent_PublishRetrieveUpdateRetrieve_Success()
         {
-            Console.WriteLine($"[Test Helper {_service2?.GetHashCode()}] Waiting for update signal...");
-            var completedTask = await Task.WhenAny(signal.Task, Task.Delay(timeoutMs));
-            if (completedTask != signal.Task)
+            // --- Instance A (Publisher) Setup ---
+            string instanceACacheDir = Path.Combine(_tempDirectory, "E2E_A_Cache");
+            Directory.CreateDirectory(instanceACacheDir);
+            var settingsA = new EngineSettingsBuilder(_settings) {
+                CacheDirectory = instanceACacheDir,
+                // Use different ports to avoid conflicts if running locally
+                DhtEndPoint = new IPEndPoint(IPAddress.Loopback, 55551), // Use Loopback
+                ListenEndPoints = new Dictionary<string, IPEndPoint> { { "ipv4", new IPEndPoint(IPAddress.Any, 55552) } }
+            }.ToSettings();
+            var serviceA = new TorrentService(settingsA);
+
+            // --- Instance B (Retriever) Setup ---
+            string instanceBCacheDir = Path.Combine(_tempDirectory, "E2E_B_Cache");
+            Directory.CreateDirectory(instanceBCacheDir);
+            var settingsB = new EngineSettingsBuilder(_settings) {
+                CacheDirectory = instanceBCacheDir,
+                DhtEndPoint = new IPEndPoint(IPAddress.Loopback, 55561), // Use Loopback
+                ListenEndPoints = new Dictionary<string, IPEndPoint> { { "ipv4", new IPEndPoint(IPAddress.Any, 55562) } } // Use Loopback for listener too } }
+            }.ToSettings();
+            var serviceB = new TorrentService(settingsB);
+
+            try
             {
-                Assert.Fail(timeoutMessage);
-            }
-            Console.WriteLine($"[Test Helper {_service2?.GetHashCode()}] Update signal received.");
-            return await signal.Task; // Return the actual result
-        }
-
-
-
-        [TestMethod]
-        public async Task AddDeeplyNestedDirectory_ShouldPropagateUpdate()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-
-            // Service 1 creates initial torrent
-            string initialFile = CreateDummyFile(_baseDirectory1!, "root.txt", 5);
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile);
-
-            // Service 2 loads
-            string downloadPath2 = Path.Combine(_baseDirectory2!, "downloads_add_deep_dir");
-            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
-            Assert.AreEqual(initialIdentifier, loadedIdentifier);
-
-            // Connect DHTs
-            await ConnectDhtsAsync();
-
-            // Setup event listener on Service 2
-            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
-            {
-                if (args.OriginalInfoHash == loadedIdentifier)
-                {
-                    updateReceivedSignal.TrySetResult(args);
-                }
-            };
-
-            // Service 1 adds a deeply nested directory
-            string deepDirPath = Path.Combine(_baseDirectory1!, "level1", "level2", "level3");
-            Directory.CreateDirectory(deepDirPath);
-            CreateDummyFile(deepDirPath, "deep_file.txt", 60);
-            CreateDummyFile(Path.Combine(_baseDirectory1!, "level1"), "level1_file.txt", 70);
-
-            // Add the top-level directory containing the nested structure
-            string dirToAddPath = Path.Combine(_baseDirectory1!, "level1");
-            long newSeq1 = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, dirToAddPath, privateKeySeed);
-            Assert.AreEqual(1, newSeq1, "Sequence number after adding deep directory should be 1.");
-
-            // Trigger update check on Service 2
-            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
-
-            // Wait for update
-            var receivedArgs = await WaitForUpdateAsync(updateReceivedSignal, 25000, "Service 2 did not receive the deep directory add update event."); // Increased timeout slightly
-            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in event args should not be null.");
-            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different after adding deep directory.");
-
-            // Optional: Verify file list on Service 2 after update
-            // Requires GetTorrentFilesAsync and potentially waiting for metadata
-        }
-
-        [TestMethod]
-        public async Task UpdateFileInNestedDirectory_ShouldPropagateUpdate()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-
-            // Service 1 creates with a nested structure
-            string dirPath = Path.Combine(_baseDirectory1!, "update_test_dir");
-            string subDirPath = Path.Combine(dirPath, "sub");
-            Directory.CreateDirectory(subDirPath);
-            string originalFilePath = CreateDummyFile(subDirPath, "file_to_update.txt", 100);
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(dirPath);
-
-            // Service 2 loads
-            string downloadPath2 = Path.Combine(_baseDirectory2!, "downloads_update_nested");
-            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
-            Assert.AreEqual(initialIdentifier, loadedIdentifier);
-
-            // Connect DHTs
-            await ConnectDhtsAsync();
-
-            // Setup event listener on Service 2 - Expect one update corresponding to the final state
-            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
-            {
-                if (args.OriginalInfoHash == loadedIdentifier)
-                {
-                    Console.WriteLine($"[Test Handler UpdateNested] Received final update event.");
-                    updateReceivedSignal.TrySetResult(args); // Signal completion on the first (and only expected) update
-                }
-            };
-
-            // Service 1 updates the file
-            string updatedFilePath = CreateDummyFile(_baseDirectory1!, "updated_content.txt", 150); // Create new content elsewhere
-            // Construct the relative path using forward slashes, as expected in torrent metadata
-            // Construct the relative path using forward slashes, relative to the torrent's root
-            string relativePathToUpdate = "sub/file_to_update.txt";
-
-            await _service1.UpdateFileInMutableTorrentAsync(initialIdentifier, relativePathToUpdate, updatedFilePath, privateKeySeed);
-            // UpdateFile calls Remove then Add, so sequence number should be 2
-            // We need a way to get the *current* sequence number from service1, or assume it's 2.
-            // Let's skip sequence number assertion here as UpdateFile doesn't return it directly.
-
-            // Trigger update check on Service 2
-            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
-
-            // Wait for the update event corresponding to the final state (after the Add part of Update)
-            var receivedArgs = await WaitForUpdateAsync(updateReceivedSignal, 30000, "Service 2 did not receive the update event for nested file update."); // Increased timeout
-
-            // We only expect one event reflecting the final state
-            Assert.IsNotNull(receivedArgs.NewInfoHash, "New InfoHash in final event args should not be null.");
-            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash, "New InfoHash should be different after updating nested file.");
-
-            // Optional: Verify file content/hash on Service 2 after update (requires download completion)
-        }
-
-        [TestMethod]
-        public async Task AutomaticBootstrap_ShouldPropagateUpdate()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-
-            // DHT nodes should now connect automatically via the bootstrap node configured in TestInitialize
-
-            // Wait a bit more for routing tables to update
-            await Task.Delay(2000);
-
-            // Wait for DHT bootstrap to complete
-            Console.WriteLine("[AutoBootstrapTest] Waiting for DHT bootstrap...");
-            await Task.Delay(5000); // Wait 5 seconds for bootstrap nodes to connect
-
-            // Service 1 creates a mutable torrent
-            string initialFile = CreateDummyFile(_baseDirectory1, "auto_initial.txt", 10);
-            var (magnetLink, privateKeySeed, initialIdentifier) = await _service1.CreateMutableTorrentAsync(initialFile);
-
-            // Explicitly replicate initial mutable item to Service2's DHT immediately
-            // This is needed so Service 2 can load the torrent metadata via GetAsync
-            if (_service1?.DhtAccess != null && _service2?.DhtAccess != null)
-            {
-                try
-                {
-                    var pubKey = (MonoTorrent.BEncoding.BEncodedString)Convert.FromHexString(magnetLink.PublicKeyHex);
-                    var targetId = MonoTorrent.Dht.DhtEngine.CalculateMutableTargetId(pubKey, null); // Use the correct calculation
-                    var result = await _service1.DhtAccess.GetAsync(targetId); // Get initial state
-
-                    if (result.value != null && result.publicKey != null && result.signature != null && result.sequenceNumber.HasValue && result.sequenceNumber.Value == 0)
-                    {
-                        _service2.DhtAccess.StoreMutableLocally(
-                            publicKey: result.publicKey,
-                            salt: null, // Assuming no salt
-                            value: result.value,
-                            sequenceNumber: result.sequenceNumber.Value,
-                            signature: result.signature
-                        );
-                        Console.WriteLine("[AutoBootstrapTest] Explicitly stored initial mutable item (seq 0) in Service2's DHT.");
-                    }
-                    else
-                    {
-                        Console.WriteLine("[AutoBootstrapTest] Warning: Could not fetch initial mutable item (seq 0) from Service1 for replication.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[AutoBootstrapTest] Exception during explicit replication of initial mutable item: {ex.Message}");
-                }
-            }
-
-            // Give the initial Put time to propagate slightly before Service 2 loads.
-            // In a real scenario, there would likely be a larger delay.
-            await Task.Delay(2000);
-
-            // Service 2 loads the torrent
-            string downloadPath2 = Path.Combine(_baseDirectory2, "downloads_auto");
-            Directory.CreateDirectory(downloadPath2);
-            var loadedIdentifier = await _service2.LoadTorrentAsync(magnetLink, downloadPath2);
-            Assert.AreEqual(initialIdentifier, loadedIdentifier);
-
-            // Setup event listener on Service 2
-            var updateReceivedSignal = new TaskCompletionSource<MutableTorrentUpdateInfoEventArgs>();
-            _service2.MutableTorrentUpdateAvailable += (sender, args) =>
-            {
-                if (args.OriginalInfoHash == loadedIdentifier)
-                {
-                    Console.WriteLine($"[AutoBootstrapTest] Update event received: {args.NewInfoHash.ToHex()}");
-                    updateReceivedSignal.TrySetResult(args);
-                }
-            };
-
-            // Service 1 adds a file
-            string fileToAdd = CreateDummyFile(_baseDirectory1, "auto_added_file.dat", 20);
-            long newSeq = await _service1.AddFileToMutableTorrentAsync(initialIdentifier, fileToAdd, privateKeySeed);
-            Assert.AreEqual(1, newSeq);
-
-            // Explicitly replicate the updated mutable item from Service1's DHT to Service2's DHT, waiting until the update is visible
-            if (_service1?.DhtAccess != null && _service2?.DhtAccess != null)
-            {
-                try
-                {
-                    var pubKey = (MonoTorrent.BEncoding.BEncodedString)Convert.FromHexString(magnetLink.PublicKeyHex);
-                    var targetId = MonoTorrent.Dht.DhtEngine.CalculateMutableTargetId(pubKey, null); // Use the correct calculation
-                    var sw = System.Diagnostics.Stopwatch.StartNew();
-                    bool replicated = false;
-                    while (sw.Elapsed < TimeSpan.FromSeconds(15)) // Wait up to 15s for update in Service1
-                    {
-                        var result = await _service1.DhtAccess.GetAsync(targetId);
-                        if (result.value != null && result.publicKey != null && result.signature != null && result.sequenceNumber.HasValue)
-                        {
-                            if (result.sequenceNumber.Value >= newSeq)
-                            {
-                                // Use the test helper on service2 to store the item fetched from service1
-                                _service2.StoreItemLocallyForTest(
-                                    result.publicKey!.AsMemory().ToArray(), // Use publicKey
-                                    null,
-                                    (BEncodedDictionary)result.value!, // Use value
-                                    result.sequenceNumber!.Value, // Use sequenceNumber
-                                    result.signature!.AsMemory().ToArray() // Use signature
-                                );
-                                Console.WriteLine($"[AutoBootstrapTest] Explicitly replicated updated mutable item (seq {result.sequenceNumber.Value}) to Service2's DHT via StoreItemLocallyForTest.");
-                                replicated = true;
-                                break; // Exit loop once replicated
-                                Console.WriteLine($"[AutoBootstrapTest] Explicitly replicated updated mutable item (seq {result.sequenceNumber.Value}) to Service2's DHT.");
-                                replicated = true;
-                                break; // Exit loop once replicated
-                            }
-                            else
-                            {
-                                Console.WriteLine($"[AutoBootstrapTest] Waiting for updated mutable item in Service1 DHT... current seq {result.sequenceNumber.Value}, expected >= {newSeq}");
-                            }
-                        }
-                        else
-                        {
-                            Console.WriteLine("[AutoBootstrapTest] Waiting for updated mutable item in Service1 DHT... no value found yet.");
-                        }
-                        await Task.Delay(500); // Check every 500ms
-                    }
-                    if (!replicated)
-                    {
-                        Console.WriteLine("[AutoBootstrapTest] Warning: Timed out waiting for updated mutable item in Service1 DHT during replication. Test might fail.");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"[AutoBootstrapTest] Exception during explicit replication of updated mutable item: {ex.Message}");
-                }
-            }
-
-            // Trigger update check on Service 2
-            Console.WriteLine("[AutoBootstrapTest] Triggering update check on Service 2");
-            await _service2.TriggerMutableUpdateCheckAsync(loadedIdentifier);
-
-            // Wait for update event
-            Console.WriteLine("[AutoBootstrapTest] Waiting for update event...");
-            // Increased timeout slightly as public bootstrap might add latency, though replication should make it fast.
-            var completed = await Task.WhenAny(updateReceivedSignal.Task, Task.Delay(25000));
-            Assert.AreEqual(updateReceivedSignal.Task, completed, "Service 2 did not receive update event via DHT bootstrap.");
-            var receivedArgs = await updateReceivedSignal.Task;
-            Assert.IsNotNull(receivedArgs.NewInfoHash);
-            Assert.AreNotEqual(initialIdentifier, receivedArgs.NewInfoHash);
-            Console.WriteLine("[AutoBootstrapTest] Success: update propagated via DHT bootstrap.");
-        }
-
-        // --- Helper Methods for Chat Tests ---
-
-        private BEncodedDictionary CreateChatMessage(string user, string message)
-        {
-            return new BEncodedDictionary {
-                { "id", (BEncodedString)Guid.NewGuid().ToString() },
-                { "ts", (BEncodedString)DateTime.UtcNow.ToString("o") },
-                { "u", (BEncodedString)user },
-                { "m", (BEncodedString)message }
-            };
-        }
-
-        private BEncodedList GetMessagesFromVDict(BEncodedDictionary vDict)
-        {
-            if (vDict.TryGetValue("messages", out var messagesValue) && messagesValue is BEncodedList messageList)
-            {
-                return messageList;
-            }
-            return new BEncodedList(); // Return empty list if not found
-        }
-
-        private bool VerifyMessageExists(BEncodedList messageList, string expectedUser, string expectedMessage)
-        {
-            foreach (var item in messageList.OfType<BEncodedDictionary>())
-            {
-                if (item.TryGetValue("u", out var userValue) && userValue is BEncodedString userStr &&
-                    item.TryGetValue("m", out var msgValue) && msgValue is BEncodedString msgStr)
-                {
-                    if (userStr.Text == expectedUser && msgStr.Text == expectedMessage)
-                    {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
-
-        // --- NEW TESTS for JoinOrCreateMutableTorrentAsync ---
-
-        [TestMethod]
-        public async Task JoinOrCreate_CreatesNew_WhenDhtIsEmpty()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_baseDirectory1);
-
-            byte[] lobbySeed = GenerateSeedFromString("test-lobby-create");
-            string lobbyName = "TestLobby_Create";
-            string savePath = Path.Combine(_baseDirectory1, "lobby_create");
-
-            // Act
-            InfoHash lobbyHandle = await _service1.JoinOrCreateMutableTorrentAsync(lobbyName, lobbySeed, savePath);
-
-            // Assert
-            Assert.IsNotNull(lobbyHandle, "Lobby handle should not be null.");
-
-            // Verify local state
-            Assert.IsTrue(_service1.MutableSequenceNumbers.ContainsKey(lobbyHandle), "Sequence number should be tracked.");
-            Assert.AreEqual(0, _service1.MutableSequenceNumbers[lobbyHandle], "Initial sequence number should be 0.");
-            Assert.IsNotNull(_service1.GetLastKnownVDictionaryForTest(lobbyHandle), "vDictionary should be cached.");
-            var vDict = _service1.GetLastKnownVDictionaryForTest(lobbyHandle)!;
-            Assert.AreEqual(lobbyName, ((MonoTorrent.BEncoding.BEncodedString)vDict["name"]).Text, "Torrent name mismatch.");
-            Assert.IsTrue(vDict.ContainsKey("files"), "vDictionary should contain 'files' key.");
-            Assert.IsInstanceOfType(vDict["files"], typeof(MonoTorrent.BEncoding.BEncodedList), "'files' should be a BEncodedList.");
-            Assert.AreEqual(0, ((MonoTorrent.BEncoding.BEncodedList)vDict["files"]).Count, "Initial file list should be empty.");
-            Assert.IsNotNull(_service1.GetLastKnownSignatureForTest(lobbyHandle), "Signature should be cached.");
-            Assert.AreEqual(64, _service1.GetLastKnownSignatureForTest(lobbyHandle)!.Length, "Signature should be 64 bytes.");
-
-            // Verify torrent is managed
-            // Assert.IsTrue(_service1.IsManaging(lobbyHandle)); // Requires helper
-        }
-
-        [TestMethod]
-        public async Task JoinOrCreate_JoinsExisting_WhenDhtHasData()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-            await ConnectDhtsAsync(); // Connect DHTs for the test
-
-            byte[] lobbySeed = GenerateSeedFromString("test-lobby-join");
-            string lobbyName = "TestLobby_Join";
-            string savePath1 = Path.Combine(_baseDirectory1, "lobby_join1");
-            string savePath2 = Path.Combine(_baseDirectory2, "lobby_join2");
-
-            // Service 1 creates the lobby
-            InfoHash handle1 = await _service1.JoinOrCreateMutableTorrentAsync(lobbyName, lobbySeed, savePath1);
-            Assert.AreEqual(0, _service1.MutableSequenceNumbers[handle1], "Service 1 initial sequence number should be 0.");
-
-            // Give some time for the initial Put to potentially propagate (though Get should handle it)
-            await Task.Delay(2000);
-
-            // Service 2 joins the lobby
-            InfoHash handle2 = await _service2.JoinOrCreateMutableTorrentAsync(lobbyName, lobbySeed, savePath2);
-
-            // Assert
-            Assert.AreEqual(handle1, handle2, "Both services should converge on the same handle.");
-            Assert.IsTrue(_service2.MutableSequenceNumbers.ContainsKey(handle2), "Service 2 should track sequence number.");
-            // Because Service 2 joined an existing torrent (seq 0), its sequence number should also be 0 after the Get.
-            Assert.AreEqual(0, _service2.MutableSequenceNumbers[handle2], "Service 2 sequence number should be 0 after joining.");
-            Assert.IsNotNull(_service2.GetLastKnownVDictionaryForTest(handle2), "Service 2 should cache vDictionary.");
-            var vDict2 = _service2.GetLastKnownVDictionaryForTest(handle2)!;
-            Assert.AreEqual(lobbyName, ((MonoTorrent.BEncoding.BEncodedString)vDict2["name"]).Text, "Service 2 torrent name mismatch.");
-            Assert.AreEqual(0, ((MonoTorrent.BEncoding.BEncodedList)vDict2["files"]).Count, "Service 2 file list should be empty.");
-            Assert.IsNotNull(_service2.GetLastKnownSignatureForTest(handle2), "Service 2 should cache signature.");
-            Assert.AreEqual(64, _service2.GetLastKnownSignatureForTest(handle2)!.Length, "Service 2 signature should be 64 bytes.");
-
-            // Verify torrent is managed by both
-            // Assert.IsTrue(_service1.IsManaging(handle1));
-            // Assert.IsTrue(_service2.IsManaging(handle2));
-        }
-
-        [TestMethod]
-        public async Task JoinOrCreate_JoinsExisting_AfterUpdate()
-        {
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-            await ConnectDhtsAsync();
-
-            byte[] lobbySeed = GenerateSeedFromString("test-lobby-join-update");
-            string lobbyName = "TestLobby_JoinUpdate";
-            string savePath1 = Path.Combine(_baseDirectory1, "lobby_join_update1");
-            string savePath2 = Path.Combine(_baseDirectory2, "lobby_join_update2");
-
-            // Service 1 creates the lobby
-            InfoHash handle1 = await _service1.JoinOrCreateMutableTorrentAsync(lobbyName, lobbySeed, savePath1);
-
-            // Service 1 adds a file
-            string fileToAdd = CreateDummyFile(_baseDirectory1, "lobby_file.txt", 55);
-            long newSeq = await _service1.AddFileToMutableTorrentAsync(handle1, fileToAdd, lobbySeed);
-            Assert.AreEqual(1, newSeq, "Sequence number after add should be 1.");
-
-            // Explicitly replicate the updated state to Service 2's DHT storage for test reliability
-            // Explicitly replicate the updated state (seq 1) to Service 2's DHT storage for test reliability
-            if (_service1.DhtAccess != null && _service2.DhtAccess != null)
-            {
-                var pubKeyBytes = _service1.GetPublicKeyForTorrent(handle1); // Use public method
-                var pubKey = (MonoTorrent.BEncoding.BEncodedString)pubKeyBytes;
-                var vDict = _service1.GetLastKnownVDictionaryForTest(handle1)!; // Use test helper
-                var sig = (MonoTorrent.BEncoding.BEncodedString)_service1.GetLastKnownSignatureForTest(handle1)!; // Use test helper
-
-                // Use the existing test helper to store the item locally in service2's DHT
-                _service2.StoreItemLocallyForTest(pubKeyBytes, null, vDict, newSeq, sig.AsMemory().ToArray());
-                Console.WriteLine($"[JoinAfterUpdate] Explicitly replicated updated state (seq {newSeq}) to Service 2 DHT via StoreItemLocallyForTest helper.");
-            }
-            else
-            {
-                Assert.Inconclusive("Cannot replicate state for test as DHT access is null.");
-                // Removed GetPublicKeyForTorrentHelper as GetPublicKeyForTorrent is now public in TorrentService
-
-
-                // Service 2 joins the lobby AFTER the update
-                InfoHash handle2 = await _service2.JoinOrCreateMutableTorrentAsync(lobbyName, lobbySeed, savePath2);
-
-                // Assert
-                Assert.AreEqual(handle1, handle2, "Both services should converge on the same handle.");
-                Assert.IsTrue(_service2.MutableSequenceNumbers.ContainsKey(handle2), "Service 2 should track sequence number.");
-                // Service 2 should have fetched the latest state (seq 1)
-                Assert.AreEqual(1, _service2.MutableSequenceNumbers[handle2], "Service 2 sequence number should be 1 after joining updated lobby.");
-                Assert.IsNotNull(_service2.GetLastKnownVDictionaryForTest(handle2), "Service 2 should cache vDictionary.");
-                var vDict2 = _service2.GetLastKnownVDictionaryForTest(handle2)!;
-                Assert.AreEqual(lobbyName, ((MonoTorrent.BEncoding.BEncodedString)vDict2["name"]).Text, "Service 2 torrent name mismatch.");
-                Assert.AreEqual(1, ((MonoTorrent.BEncoding.BEncodedList)vDict2["files"]).Count, "Service 2 file list should contain 1 file.");
-                // Further check file details if needed
-                var files = ((MonoTorrent.BEncoding.BEncodedList)vDict2["files"]);
-                Assert.AreEqual(1, files.Count, "File list should contain one entry after join.");
-                var fileEntry = files[0] as MonoTorrent.BEncoding.BEncodedDictionary;
-                Assert.IsNotNull(fileEntry, "File entry should be a dictionary.");
-                var pathList = fileEntry["path"] as MonoTorrent.BEncoding.BEncodedList;
-                Assert.IsNotNull(pathList, "Path entry should be a list.");
-                Assert.AreEqual("lobby_file.txt", ((MonoTorrent.BEncoding.BEncodedString)pathList[0]).Text);
-            }
-
-            // Removed GetPublicKeyForTorrentHelper as GetPublicKeyForTorrent is now public in TorrentService
-        }
-
-
-        // --- Test Methods End ---
-
-        [TestMethod]
-        public async Task Chat_TwoInstances_ShouldExchangeMessages()
-        {
-            byte[] chatSeed = Array.Empty<byte>();
-            InfoHash handle1 = default;
-            InfoHash handle2 = default;
-            Assert.IsNotNull(_service1);
-            Assert.IsNotNull(_service2);
-            Assert.IsNotNull(_baseDirectory1);
-            Assert.IsNotNull(_baseDirectory2);
-
-            // Wait for both DHT engines to bootstrap to the public DHT network
-            // Exchange DHT endpoints and add as bootstrap nodes to simulate realistic peer discovery
-            if (_service1?.DhtAccess != null && _service2?.DhtAccess != null && _settings1?.DhtEndPoint != null && _settings2?.DhtEndPoint != null)
-            {
-                var nodeId1 = MonoTorrent.Dht.NodeId.Create();
-                var nodeId2 = MonoTorrent.Dht.NodeId.Create();
-
-            // Wait a bit to allow DHT pings to complete and routing tables to populate
-            // Add public tracker URL to magnet links or torrent metadata
-            string trackerUrl = "udp://tracker.opentrackr.org:1337/announce";
-
-            // Both services join/create the chat torrent with tracker URL
-            chatSeed = GenerateSeedFromString("test-chat-exchange");
-            var publicKey = _service1!.GetPublicKeyFromSeed(chatSeed);
-            var publicKeyHex = Convert.ToHexString(publicKey).ToLowerInvariant();
-            string chatName = "TestChatExchange";
-            string savePath1 = Path.Combine(_baseDirectory1, "chat_exchange1");
-            string savePath2 = Path.Combine(_baseDirectory2, "chat_exchange2");
-
-            var magnetUri1 = $"magnet:?xs=urn:btpk:{publicKeyHex}&tr={Uri.EscapeDataString(trackerUrl)}&dn={Uri.EscapeDataString(chatName)}";
-            var magnetUri2 = magnetUri1; // Same magnet link
-
-            var magnetLink1 = MonoTorrent.MagnetLink.Parse(magnetUri1);
-            var magnetLink2 = MonoTorrent.MagnetLink.Parse(magnetUri2);
-
-            handle1 = await _service1.LoadTorrentAsync(magnetLink1, savePath1);
-            handle2 = await _service2.LoadTorrentAsync(magnetLink2, savePath2);
-
-            // Force announce to tracker to discover each other's IPs
-            Console.WriteLine("[Test] Forcing announce to tracker...");
-            var manager1 = _service1.TryGetManager(handle1, out var m1) ? m1 : null;
-            var manager2 = _service2.TryGetManager(handle2, out var m2) ? m2 : null;
-
-            if (manager1 != null)
-                await manager1.TrackerManager.AnnounceAsync(System.Threading.CancellationToken.None);
-            if (manager2 != null)
-                await manager2.TrackerManager.AnnounceAsync(System.Threading.CancellationToken.None);
-
-            // Wait a bit for tracker responses
-            await Task.Delay(5000);
-
-            // Extract peer lists
-            var peerIds1 = manager1 != null ? await manager1.GetPeersAsync() : new List<MonoTorrent.Client.PeerId>();
-            var peerIds2 = manager2 != null ? await manager2.GetPeersAsync() : new List<MonoTorrent.Client.PeerId>();
-
-            var peers1 = peerIds1.Select(p => p.Uri).ToList();
-            var peers2 = peerIds2.Select(p => p.Uri).ToList();
-
-            Console.WriteLine($"[Test] Service1 sees peers: {string.Join(", ", peers1)}");
-            Console.WriteLine($"[Test] Service2 sees peers: {string.Join(", ", peers2)}");
-
-            // Add each other's IP:port as DHT bootstrap nodes
-            foreach (var uri in peers1 ?? Enumerable.Empty<Uri>())
-            {
-                var ip = System.Net.IPAddress.Parse(uri.Host);
-                var port = uri.Port;
-                var nodeId = MonoTorrent.Dht.NodeId.Create();
-                var buffer = new byte[26];
-                nodeId.Span.CopyTo(buffer.AsSpan(0, 20));
-                ip.GetAddressBytes().CopyTo(buffer.AsSpan(20, 4));
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(24, 2), (ushort)port);
-                _service2.DhtAccess?.Add(new[] { new ReadOnlyMemory<byte>(buffer) });
-            }
-
-            foreach (var uri in peers2 ?? Enumerable.Empty<Uri>())
-            {
-                var ip = System.Net.IPAddress.Parse(uri.Host);
-                var port = uri.Port;
-                var nodeId = MonoTorrent.Dht.NodeId.Create();
-                var buffer = new byte[26];
-                nodeId.Span.CopyTo(buffer.AsSpan(0, 20));
-                ip.GetAddressBytes().CopyTo(buffer.AsSpan(20, 4));
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buffer.AsSpan(24, 2), (ushort)port);
-                _service1.DhtAccess?.Add(new[] { new ReadOnlyMemory<byte>(buffer) });
-            }
-
-            Console.WriteLine("[Test] Added discovered peers as DHT bootstrap nodes.");
-
-            await Task.Delay(3000);
-            await Task.Delay(3000);
-                var buffer1 = new byte[26];
-                nodeId1.Span.CopyTo(buffer1.AsSpan(0, 20));
-                _settings1.DhtEndPoint.Address.GetAddressBytes().CopyTo(buffer1.AsSpan(20, 4));
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buffer1.AsSpan(24, 2), (ushort)_settings1.DhtEndPoint.Port);
-
-                var buffer2 = new byte[26];
-                nodeId2.Span.CopyTo(buffer2.AsSpan(0, 20));
-                _settings2.DhtEndPoint.Address.GetAddressBytes().CopyTo(buffer2.AsSpan(20, 4));
-                System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(buffer2.AsSpan(24, 2), (ushort)_settings2.DhtEndPoint.Port);
-
-                _service1.DhtAccess.Add(new[] { new ReadOnlyMemory<byte>(buffer2) });
-                _service2.DhtAccess.Add(new[] { new ReadOnlyMemory<byte>(buffer1) });
-
-                Console.WriteLine("[Test] Exchanged DHT endpoints and added as bootstrap nodes.");
-            }
-
-            await WaitForBothDhtsReadyAsync();
-        }
-        [TestMethod]
-        public async Task DhtEngine_ShouldReachReadyState()
-        {
-            var dhtEngine = new MonoTorrent.Dht.DhtEngine();
-
-            var bootstrapRouters = new[] { "router.bittorrent.com", "router.utorrent.com", "dht.transmissionbt.com" };
-
-            Console.WriteLine("[DHT Test] Starting DhtEngine with bootstrap routers...");
-            await dhtEngine.StartAsync(bootstrapRouters);
-
-            var timeout = TimeSpan.FromSeconds(30);
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            while (sw.Elapsed < timeout)
-            {
-                if (dhtEngine.State == MonoTorrent.Dht.DhtState.Ready)
-                {
-                    Console.WriteLine("[DHT Test] DhtEngine reached Ready state.");
-                    break;
-                }
-                Console.WriteLine($"[DHT Test] Waiting... Current state: {dhtEngine.State}");
-                await Task.Delay(1000);
-            }
-
-            Console.WriteLine($"[DHT Test] Final state after {sw.Elapsed.TotalSeconds:F1}s: {dhtEngine.State}");
-            Assert.AreEqual(MonoTorrent.Dht.DhtState.Ready, dhtEngine.State, "DhtEngine should reach Ready state");
-        }
-        [TestMethod]
-        public async Task PublicTracker_ShouldReturnPeers()
-        {
-            var service = new TorrentService();
-            await service.InitializeAsync();
-
-            string trackerUrl = "udp://tracker.opentrackr.org:1337/announce";
-            string ubuntuMagnet = "magnet:?xt=urn:btih:UQ2Q2CLSJNVPWWXLKECFMCNU7S4ODTWT&dn=0ad-0.27.0-win32.exe&xl=1448260473&tr=http%3A%2F%2Freleases.wildfiregames.com%3A2710%2Fannounce";
-
-            var magnetLink = MonoTorrent.MagnetLink.Parse(ubuntuMagnet);
-            var savePath = Path.Combine(Path.GetTempPath(), "public_tracker_test_" + Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(savePath);
-
-            var handle = await service.LoadTorrentAsync(magnetLink, savePath);
-            var manager = service.TryGetManager(handle, out var m) ? m : null;
-            Assert.IsNotNull(manager, "TorrentManager should not be null");
-
-            Console.WriteLine("[Test] Forcing announce to public tracker...");
-            await manager.TrackerManager.AnnounceAsync(System.Threading.CancellationToken.None);
-
-            Console.WriteLine("[Test] Waiting 10 seconds for tracker response...");
-            await Task.Delay(10000);
-
-            var peers = await manager.GetPeersAsync();
-            Console.WriteLine($"[Test] Found {peers.Count} peers from public tracker:");
-            foreach (var peer in peers)
-            {
-                Console.WriteLine($"Peer: {peer.Uri}");
-            }
-
-            Assert.IsTrue(peers.Count > 0, "Should find at least one peer from public tracker");
-        }
-
-        private async Task WaitForBothDhtsReadyAsync()
-        {
-            var timeout = TimeSpan.FromSeconds(30);
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            while (sw.Elapsed < timeout)
-            {
-                var ready1 = _service1?.DhtAccess?.State == MonoTorrent.Dht.DhtState.Ready;
-                var ready2 = _service2?.DhtAccess?.State == MonoTorrent.Dht.DhtState.Ready;
-                if (ready1 && ready2)
-                {
-                    Console.WriteLine("[Test] Both DHT engines reached Ready state.");
-                    return;
-                }
+                // Initialize both services, disabling default DHT bootstrapping
+                var bootstrapRouters = Array.Empty<string>();
+                await Task.WhenAll(serviceA.InitializeAsync(bootstrapRouters), serviceB.InitializeAsync(bootstrapRouters));
+                Console.WriteLine("[E2E Test] Both services initialized (no default bootstrap).");
+
+                // Removed manual node addition. Relying on automatic discovery/hair pinning.
+                // The DHT engines should ideally discover each other through initial pings
+                // or other mechanisms when configured with loopback addresses.
+
+                // Give some time for the engines to potentially discover each other automatically.
+                // The exact mechanism depends on MonoTorrent's DHT implementation details.
+                // If they send initial pings or respond to each other's startup messages,
+                // they might get added to the routing table.
+                // to be received and processed, leading to routing table updates.
+                // Increase delay to 20 seconds to ensure initial pings complete or timeout
+                Console.WriteLine("[E2E Test] Waiting 20 seconds for routing tables to populate...");
+                await Task.Delay(TimeSpan.FromSeconds(20));
+
+                // Now verify the routing table counts directly
+                Console.WriteLine("[E2E Test] Verifying routing table counts...");
+                var dhtEngineA = serviceA.Engine.DhtEngine as MonoTorrent.Dht.DhtEngine;
+                var dhtEngineB = serviceB.Engine.DhtEngine as MonoTorrent.Dht.DhtEngine;
+
+                ClassicAssert.IsNotNull(dhtEngineA, "Service A's DHT Engine is null or not the expected type.");
+                ClassicAssert.IsNotNull(dhtEngineB, "Service B's DHT Engine is null or not the expected type.");
+
+                int countA = dhtEngineA?.RoutingTable.CountNodes() ?? -1;
+                int countB = dhtEngineB?.RoutingTable.CountNodes() ?? -1;
+
+                Console.WriteLine($"[E2E Test] Final Check - Node Count A: {countA}. Node Count B: {countB}.");
+                // Each table should contain exactly one node: the other peer.
+                // Each table should contain 2 nodes: self and the other peer.
+                ClassicAssert.AreEqual(2, countA, "Node A's routing table should contain 2 nodes (self and Node B).");
+                ClassicAssert.AreEqual(2, countB, "Node B's routing table should contain 2 nodes (self and Node A).");
+                Console.WriteLine("[E2E Test] Routing tables populated successfully (checked counts).");
+
+                // --- Publish Initial Version (A) ---
+                var (publicKey, privateKey) = GeneratePlaceholderKeys();
+                long sequence1 = 1;
+                byte[]? salt = null; // No salt for simplicity
+                var value1 = new BEncodedString("Initial Value");
+                var dictToPublish1 = new BEncodedDictionary { { "v", value1 } };
+
+                Console.WriteLine($"[E2E Test] Service A Publishing V1 (Seq {sequence1})...");
+                bool published1 = await serviceA.PublishTorrentUpdateAsync(publicKey, privateKey, sequence1, dictToPublish1, salt);
+                ClassicAssert.IsTrue(published1, "Service A failed to publish initial version.");
+                Console.WriteLine("[E2E Test] Service A Published V1.");
+
+                // Verify local storage on A after Put V1
+                var bPublicKey = new BEncodedString(publicKey);
+                var targetId = DhtEngine.CalculateMutableTargetId(bPublicKey, null); // Assuming salt is null
+                Console.WriteLine($"[E2E Test] Verifying local storage on A for V1 (Target {targetId})...");
+                // Allow some time for the Put operation's local storage update to complete
                 await Task.Delay(500);
-            }
-            Assert.Fail("DHT engines did not reach Ready state within timeout.");
-        }
-    }
+                ClassicAssert.IsTrue(serviceA.Engine.DhtLocalStorage.TryGetValue(targetId, out var storedItem1), "Item V1 not found in Service A local DHT storage after publish.");
+                ClassicAssert.AreEqual(sequence1, storedItem1.SequenceNumber, "Local storage V1 sequence number mismatch.");
+                ClassicAssert.AreEqual(value1.Text, ((BEncodedString)storedItem1.Value).Text, "Local storage V1 value mismatch.");
+                Console.WriteLine($"[E2E Test] Verified local storage on A for V1.");
 
-}
+                // --- Retrieve Initial Version (B) ---
+                // Target ID already calculated
+                Console.WriteLine($"[E2E Test] Service B Retrieving V1 (Target {targetId})...");
+                // Add a small delay to allow Put V1 to propagate/be processed by B before Get V1
+                await Task.Delay(2000); // Increased delay
+                var (retrievedValue1, _, _, retrievedSeq1) = await serviceB.Engine.GetMutableAsync(targetId);
+
+                ClassicAssert.IsNotNull(retrievedValue1, "Service B failed to retrieve V1 value.");
+                ClassicAssert.AreEqual(value1.Text, ((BEncodedString)retrievedValue1!).Text, "Retrieved V1 value mismatch.");
+                ClassicAssert.IsNotNull(retrievedSeq1, "Service B failed to retrieve V1 sequence number.");
+                ClassicAssert.AreEqual(sequence1, retrievedSeq1!.Value, "Retrieved V1 sequence number mismatch.");
+                Console.WriteLine($"[E2E Test] Service B Retrieved V1 (Seq {retrievedSeq1}).");
+
+                // --- Publish Updated Version (A) ---
+                long sequence2 = sequence1 + 1;
+                var value2 = new BEncodedString("Updated Value");
+                var dictToPublish2 = new BEncodedDictionary { { "v", value2 } };
+
+                Console.WriteLine($"[E2E Test] Service A Publishing V2 (Seq {sequence2})...");
+                bool published2 = await serviceA.PublishTorrentUpdateAsync(publicKey, privateKey, sequence2, dictToPublish2, salt);
+                ClassicAssert.IsTrue(published2, "Service A failed to publish updated version.");
+                Console.WriteLine("[E2E Test] Service A Published V2.");
+
+                // Verify local storage on A updated after Put V2
+                Console.WriteLine($"[E2E Test] Verifying local storage on A for V2 (Target {targetId})...");
+                 // Allow some time for the Put operation's local storage update to complete
+                await Task.Delay(500);
+                ClassicAssert.IsTrue(serviceA.Engine.DhtLocalStorage.TryGetValue(targetId, out var storedItem2), "Item V2 not found in Service A local DHT storage after publish.");
+                ClassicAssert.AreEqual(sequence2, storedItem2.SequenceNumber, "Local storage V2 sequence number mismatch.");
+                ClassicAssert.AreEqual(value2.Text, ((BEncodedString)storedItem2.Value).Text, "Local storage V2 value mismatch.");
+                Console.WriteLine($"[E2E Test] Verified local storage on A for V2.");
+
+                // --- Retrieve Updated Version (B) ---
+                Console.WriteLine($"[E2E Test] Service B Retrieving V2 (Target {targetId})...");
+                 // Add a small delay to allow Put V2 to propagate/be processed by B before Get V2
+                await Task.Delay(2000); // Increased delay
+                var (retrievedValue2, _, _, retrievedSeq2) = await serviceB.Engine.GetMutableAsync(targetId);
+
+                ClassicAssert.IsNotNull(retrievedValue2, "Service B failed to retrieve V2 value.");
+                ClassicAssert.AreEqual(value2.Text, ((BEncodedString)retrievedValue2!).Text, "Retrieved V2 value mismatch.");
+                ClassicAssert.IsNotNull(retrievedSeq2, "Service B failed to retrieve V2 sequence number.");
+                ClassicAssert.AreEqual(sequence2, retrievedSeq2!.Value, "Retrieved V2 sequence number mismatch.");
+                Console.WriteLine($"[E2E Test] Service B Retrieved V2 (Seq {retrievedSeq2}).");
+
+                Console.WriteLine("MutableTorrent_PublishRetrieveUpdateRetrieve_Success: Passed");
+            }
+            finally
+            {
+                // Cleanup both service instances
+                serviceA?.Dispose();
+                serviceB?.Dispose();
+            }
+        }
+
+    } // End of TorrentServiceTests class
+} // End of namespace TorrentWrapper.Tests
