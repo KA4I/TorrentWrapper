@@ -51,8 +51,8 @@ namespace TorrentWrapper.Tests
             // Base settings used by most tests. NATS test will override some.
             _settings = new EngineSettingsBuilder
             {
-                AllowPortForwarding = false, // Default to false, NATS test enables it
-                AllowLocalPeerDiscovery = false,
+                AllowPortForwarding = true, // Default to false, NATS test enables it
+                AllowLocalPeerDiscovery = true,
                 AllowMultipleTorrentInstances = true,
                 AutoSaveLoadFastResume = false,
                 AutoSaveLoadMagnetLinkMetadata = true,
@@ -62,8 +62,8 @@ namespace TorrentWrapper.Tests
                 DhtEndPoint = new IPEndPoint(IPAddress.Any, 0),
                 ListenEndPoints = new Dictionary<string, IPEndPoint> { { "ipv4", new IPEndPoint(IPAddress.Any, 0) } },
                 // NATS settings default to disabled here
-                AllowNatsDiscovery = false,
-                NatsOptions = null
+                AllowNatsDiscovery = true,
+                NatsOptions = TestNatsOptions
             }.ToSettings();
 
             _service = new TorrentService(_settings); // Pass EngineSettings only

@@ -6,6 +6,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using MonoTorrent;
+using MonoTorrent.Dht; // Added
 using MonoTorrent.BEncoding;
 using MonoTorrent.Client;
 using MonoTorrent.Dht;
@@ -107,6 +108,7 @@ namespace TorrentWrapper
             long sequenceNumber,
             BEncodedDictionary updatedTorrentDict,
             byte[]? salt = null,
+            long? expectedPreviousSequence = null, // Added for CAS
             CancellationToken token = default)
         {
             if (!_isInitialized) throw new InvalidOperationException("TorrentService must be initialized before publishing updates.");
@@ -180,8 +182,8 @@ namespace TorrentWrapper
                 var bSignature = new BEncodedString(signatureBytes);
 
                 // 5. Call the public wrapper method on the ClientEngine
-                // Pass null for cas for now
-                await _engine.PutMutableAsync(bPublicKey, bSalt, valueToStore, sequenceNumber, bSignature, null);
+                // Pass the expectedPreviousSequence for CAS if provided
+                await _engine.PutMutableAsync(bPublicKey, bSalt, valueToStore, sequenceNumber, bSignature, expectedPreviousSequence);
 
                 Console.WriteLine($"[TorrentService] Successfully published mutable torrent update for PK: {Convert.ToHexString(publicKey)}");
                 return true;
@@ -197,5 +199,91 @@ namespace TorrentWrapper
         }
 
         // Placeholder for GetPeersAsync (item 9) - Already exists in TorrentService.Peers.cs
+
+        /// <summary>
+        /// Retrieves the latest sequence number and value ('v' dictionary) for a mutable torrent from the DHT.
+        /// This implicitly triggers an update check if the data is not fresh.
+        /// </summary>
+        /// <param name="publicKey">The public key identifying the mutable torrent.</param>
+        /// <param name="salt">Optional salt associated with the mutable torrent.</param>
+        /// <param name="token">Cancellation token.</param>
+        /// <returns>A tuple containing the sequence number and the BEncodedDictionary value ('v'). Returns (-1, null) if not found or on error.</returns>
+        public async Task<(long sequenceNumber, BEncodedDictionary? vDictionary)> GetAndUpdateTorrentStateAsync(
+            byte[] publicKey,
+            byte[]? salt = null,
+            CancellationToken token = default) // Keep token in signature for future compatibility
+        {
+            if (!_isInitialized) throw new InvalidOperationException("TorrentService must be initialized before getting mutable state.");
+            if (publicKey == null || publicKey.Length != 32) throw new ArgumentException("Public key must be 32 bytes.", nameof(publicKey));
+
+            var bPublicKey = new BEncodedString(publicKey);
+            var bSalt = salt == null ? null : new BEncodedString(salt);
+            var targetId = DhtEngine.CalculateMutableTargetId(bPublicKey, bSalt);
+
+            Console.WriteLine($"[TorrentService] Getting mutable state for PK: {Convert.ToHexString(publicKey)}, TargetId: {targetId.ToHex()}");
+
+            try
+            {
+                // Call GetMutableAsync(NodeId target) and deconstruct the result tuple
+                var (value, _, _, sequenceNumber) = await _engine.GetMutableAsync(targetId); // Discard pk and sig
+
+                // Check if sequenceNumber has a value, indicating the item was found
+                if (sequenceNumber.HasValue)
+                {
+                    long sequence = sequenceNumber.Value; // Get the actual sequence number
+
+                    if (value is BEncodedDictionary vDict)
+                    {
+                        Console.WriteLine($"[TorrentService] Retrieved mutable state. Seq: {sequence}");
+                        return (sequence, vDict);
+                    }
+                    else // Found item but value wasn't a dictionary?
+                    {
+                        Console.WriteLine($"[TorrentService WARNING] Retrieved mutable state for Seq: {sequence}, but value is not a BEncodedDictionary (Type: {value?.GetType().Name}).");
+                        return (sequence, null); // Return sequence number but null dictionary
+                    }
+                }
+                else // Not found (sequenceNumber is null)
+                {
+                    Console.WriteLine($"[TorrentService] Mutable state not found in DHT for TargetId: {targetId.ToHex()}");
+                    return (-1, null); // Return -1 sequence to indicate not found
+                }
+            }
+            catch (OperationCanceledException) // Keep CancellationToken in signature even if not passed, in case it's used internally or in future
+            {
+                 Console.WriteLine($"[TorrentService] GetMutableAsync cancelled for TargetId: {targetId.ToHex()}");
+                 token.ThrowIfCancellationRequested(); // Re-throw if cancellation was requested
+                 return (-1, null); // Return default if not cancelled by token
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[TorrentService ERROR] Failed to get mutable state for TargetId {targetId.ToHex()}: {ex.Message}");
+                // Consider logging stack trace: Console.WriteLine(ex.StackTrace);
+                return (-1, null); // Indicate error
+            }
+        }
+
+        /// <summary>
+        /// Generates Ed25519 public and private keys from a 32-byte seed.
+        /// </summary>
+        /// <param name="seed">The 32-byte seed.</param>
+        /// <returns>A tuple containing the 32-byte public key and 64-byte private key.</returns>
+        /// <exception cref="ArgumentException">Thrown if the seed is not 32 bytes.</exception>
+        public static (byte[] publicKey, byte[] privateKey) GetKeysFromSeed(byte[] seed)
+        {
+            if (seed == null || seed.Length != 32)
+                throw new ArgumentException("Seed must be 32 bytes.", nameof(seed));
+
+            // BouncyCastle expects the private key seed directly for parameters
+            var privateKeyParams = new Ed25519PrivateKeyParameters(seed, 0);
+            var publicKeyParams = privateKeyParams.GeneratePublicKey();
+
+            // The private key in many contexts (like NaCl/libsodium) is seed + public key
+            byte[] privateKeyBytes = new byte[64];
+            Buffer.BlockCopy(privateKeyParams.GetEncoded(), 0, privateKeyBytes, 0, 32); // Copy seed
+            Buffer.BlockCopy(publicKeyParams.GetEncoded(), 0, privateKeyBytes, 32, 32); // Copy public key
+
+            return (publicKeyParams.GetEncoded(), privateKeyBytes);
+        }
     }
 }
