@@ -16,6 +16,8 @@ using MonoTorrent.PortForwarding;
 using NATS.Client.Core;
 using MonoTorrent;
 using System.Security.Cryptography; // Added for SHA1
+using MonoTorrent; // Provides Factories
+using MonoTorrent.Connections.Peer;
 
 namespace TorrentWrapper
 {
@@ -34,7 +36,6 @@ namespace TorrentWrapper
         public TorrentService(EngineSettings? engineSettings = null)
         {
             // Use provided settings or create default ones.
-            // NATS options should be configured within the passed EngineSettings.
             _engineSettings = engineSettings ?? new EngineSettingsBuilder
             {
                 // Sensible defaults - allow port forwarding, use ephemeral ports
@@ -46,7 +47,11 @@ namespace TorrentWrapper
 
             // Initialize the engine with the final settings.
             // ClientEngine constructor now handles NATS service creation internally if configured.
-            _engine = new ClientEngine(_engineSettings);
+            // But we want to inject our NatsTurnConnection for 'natsturn' URIs.
+            var factories = Factories.Default.WithPeerConnectionCreator(
+                "natsturn",
+                uri => new NatsTurnConnection(uri, _engineSettings.NatsOptions!));
+            _engine = new ClientEngine(_engineSettings, factories);
         }
 
         public ClientEngine Engine => _engine;
@@ -136,9 +141,9 @@ namespace TorrentWrapper
 
         private void TorrentManager_PeerDisconnected(object? sender, PeerDisconnectedEventArgs e)
         {
-             if (sender is TorrentManager manager && e.Peer.Uri != null)
+            if (sender is TorrentManager manager && e.Peer.Uri != null)
             {
-                 if (_connectedPeers.TryGetValue(manager.InfoHashes, out var peerList))
+                if (_connectedPeers.TryGetValue(manager.InfoHashes, out var peerList))
                 {
                     peerList.TryRemove(e.Peer.Uri, out _);
                     // Console.WriteLine($"[TorrentService] Peer disconnected: {e.Peer.Uri} for torrent {manager.InfoHashes.V1OrV2.ToHex()}");
