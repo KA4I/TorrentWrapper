@@ -32,6 +32,11 @@ namespace TorrentWrapper
         // Dictionary to track connected peers per torrent
         private readonly ConcurrentDictionary<InfoHashes, ConcurrentDictionary<Uri, PeerInfo>> _connectedPeers = new ConcurrentDictionary<InfoHashes, ConcurrentDictionary<Uri, PeerInfo>>();
 
+        // --- Add Initialization Signal --- 
+        private readonly TaskCompletionSource<bool> _initializationComplete = new TaskCompletionSource<bool>();
+        public Task InitializationTask => _initializationComplete.Task;
+        // --------------------------------
+
         // Consider making NATS optional
         public TorrentService(EngineSettings? engineSettings = null)
         {
@@ -92,6 +97,7 @@ namespace TorrentWrapper
 
             _isInitialized = true;
             Console.WriteLine("[TorrentService] Initialization complete.");
+            _initializationComplete.TrySetResult(true); // Signal completion
         }
 
         /// <summary>
@@ -123,6 +129,7 @@ namespace TorrentWrapper
 
             _isInitialized = true;
             Console.WriteLine("[TorrentService] Initialization complete.");
+            _initializationComplete.TrySetResult(true); // Signal completion
         }
 
         private void TorrentManager_PeerConnected(object? sender, PeerConnectedEventArgs e)
